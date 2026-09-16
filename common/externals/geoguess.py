@@ -148,7 +148,11 @@ async def fetch_photo():
     }
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=8),
-        headers={'User-Agent': 'MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)'},
+        headers={
+            'User-Agent': 'MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)',
+            # The locked Brotli 1.1 decoder is incompatible with aiohttp's bounded decoding.
+            'Accept-Encoding': 'gzip, deflate',
+        },
     ) as session:
         data = await request_json(session, 'https://commons.wikimedia.org/w/api.php', params)
         photos = candidates(data)
