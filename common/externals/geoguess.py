@@ -1,38 +1,26 @@
 """Random geotagged Commons photos. No media downloads or local cache."""
 import asyncio
 import math
+import os
+import time
 import random
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 import aiohttp
+import pytz
+from babel import Locale
+from cachetools import TTLCache
 
 from common.externals.exceptions import ExternalServiceError
 
-# Inland search points with small radii keep the answer unambiguous.
-PLACES = (
-    ('Норвегия', 'Берген', 60.397, 5.325),
-    ('Португалия', 'Лиссабон', 38.711, -9.130),
-    ('Япония', 'Киото', 35.003, 135.778),
-    ('Франция', 'Париж', 48.8584, 2.2945),
-    ('Италия', 'Рим', 41.8902, 12.4922),
-    ('Испания', 'Севилья', 37.386, -5.993),
-    ('Германия', 'Мюнхен', 48.1372, 11.5756),
-    ('Чехия', 'Прага', 50.0875, 14.4213),
-    ('Польша', 'Краков', 50.0614, 19.9366),
-    ('Венгрия', 'Будапешт', 47.4979, 19.0402),
-    ('Греция', 'Афины', 37.9715, 23.7257),
-    ('Турция', 'Стамбул', 41.0086, 28.9802),
-    ('Великобритания', 'Эдинбург', 55.9486, -3.1999),
-    ('Швеция', 'Стокгольм', 59.325, 18.071),
-    ('Финляндия', 'Хельсинки', 60.169, 24.952),
-    ('США', 'Чикаго', 41.8826, -87.6226),
-    ('Канада', 'Монреаль', 45.504, -73.556),
-    ('Мексика', 'Мехико', 19.4326, -99.1332),
-    ('Бразилия', 'Рио-де-Жанейро', -22.9519, -43.2105),
-    ('Австралия', 'Сидней', -33.8568, 151.2153),
-)
+# Labels only, never a list of allowed photo locations. ISO countries and territories.
+COUNTRIES = {code.lower(): Locale('ru').territories[code] for code in pytz.country_names}
+GEOCODER_URL = os.environ.get('GEOGUESS_GEOCODER_URL', 'https://nominatim.openstreetmap.org/reverse')
+_geocoder_lock = None
+_geocoder_next = 0.0
+_geocoder_cache = TTLCache(maxsize=1024, ttl=86400)
 
 
 class PlainText(HTMLParser):
@@ -68,8 +56,14 @@ class Photo:
     license_url: str
 
 
-def candidates(data, place):
-    country, city, lat, lon = place
+@dataclass(frozen=True)
+class Candidate:
+    photo: Photo
+    latitude: float
+    longitude: float
+
+
+def candidates(data):
     photos = []
     for page in data.get('query', {}).get('pages', {}).values():
         try:
@@ -80,8 +74,7 @@ def candidates(data, place):
             if info['mime'] != 'image/jpeg' or min(info['width'], info['height']) < 600:
                 continue
             latitude, longitude = float(value('GPSLatitude')), float(value('GPSLongitude'))
-            distance = math.hypot((latitude - lat) * 111320, (longitude - lon) * 111320 * math.cos(math.radians(lat)))
-            if not math.isfinite(distance) or distance > 1000:
+            if not (math.isfinite(latitude) and math.isfinite(longitude) and -90 <= latitude <= 90 and -180 <= longitude <= 180):
                 continue
             url = info.get('thumburl', info['url'])
             license_url = value('LicenseUrl').replace('http://', 'https://', 1)
@@ -94,33 +87,87 @@ def candidates(data, place):
             license_name = plain(value('LicenseShortName'), 40)
             if not author or not license_name or pageid <= 0:
                 continue
-            photos.append(Photo(country, city, url, f'https://commons.wikimedia.org/?curid={pageid}', author, license_name, license_url))
+            photos.append(Candidate(Photo('', '', url, f'https://commons.wikimedia.org/?curid={pageid}', author, license_name, license_url), latitude, longitude))
         except (KeyError, IndexError, TypeError, ValueError):
             continue
     return photos
 
 
-async def random_photo() -> Photo:
-    place = random.choice(PLACES)
+async def request_json(session, url, params):
+    async with session.get(url, params=params, allow_redirects=False) as response:
+        if response.status != 200:
+            raise ExternalServiceError('Источник сейчас недоступен.')
+        data = await response.json()
+        if not isinstance(data, dict):
+            raise ExternalServiceError('Источник вернул ошибку.')
+        return data
+
+
+class UnknownLocation(ExternalServiceError):
+    pass
+
+
+def location(data):
+    address = data.get('address', {})
+    code = address.get('country_code', '').lower()
+    if code not in COUNTRIES or not address.get('country'):
+        raise UnknownLocation('Не удалось определить страну фотографии.')
+    city = next((address[key] for key in ('city', 'town', 'village', 'municipality', 'county', 'state') if address.get(key)), '')
+    return COUNTRIES[code], plain(city, 100)
+
+
+async def reverse_location(session, latitude, longitude):
+    # Public Nominatim: one request at a time, at most 1/s across all chats.
+    # Cache metadata only; images are never downloaded or stored.
+    global _geocoder_lock, _geocoder_next
+    if _geocoder_lock is None:
+        _geocoder_lock = asyncio.Lock()
+    key = (latitude, longitude)
+    async with _geocoder_lock:
+        if key in _geocoder_cache:
+            return _geocoder_cache[key]
+        await asyncio.sleep(max(0, _geocoder_next - time.monotonic()))
+        _geocoder_next = time.monotonic() + 1.1
+        data = await request_json(session, GEOCODER_URL, {
+            'format': 'jsonv2', 'lat': latitude, 'lon': longitude,
+            'zoom': 10, 'addressdetails': 1, 'accept-language': 'ru',
+        })
+        result = location(data)
+        _geocoder_cache[key] = result
+        return result
+
+
+async def fetch_photo():
+    # Sample the entire Commons file namespace, then keep usable geotagged photos.
+    # No city list, country filter, geographic radius or search-result ranking.
     params = {
-        'action': 'query', 'generator': 'geosearch', 'ggscoord': f'{place[2]}|{place[3]}',
-        'ggsradius': 700, 'ggsnamespace': 6, 'ggslimit': 20,
+        'action': 'query', 'generator': 'random', 'grnnamespace': 6, 'grnlimit': 30,
         'prop': 'imageinfo', 'iiprop': 'url|extmetadata|mime|size',
         'iiextmetadatafilter': 'Artist|LicenseShortName|LicenseUrl|GPSLatitude|GPSLongitude',
-        'iiurlwidth': 960, 'format': 'json',
+        'iiurlwidth': 960, 'format': 'json', 'maxage': 0, 'smaxage': 0,
     }
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=8),
+        headers={'User-Agent': 'MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)'},
+    ) as session:
+        data = await request_json(session, 'https://commons.wikimedia.org/w/api.php', params)
+        photos = candidates(data)
+        if not photos:
+            raise ExternalServiceError('Подходящего фото не нашлось.')
+        random.shuffle(photos)
+        for candidate in photos[:4]:
+            try:
+                country, city = await reverse_location(session, candidate.latitude, candidate.longitude)
+            except UnknownLocation:
+                continue
+            photo = candidate.photo
+            return Photo(country, city, photo.url, photo.source, photo.author, photo.license, photo.license_url)
+        raise ExternalServiceError('Нет фото с определённой страной.')
+
+
+async def random_photo() -> Photo:
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            headers={'User-Agent': 'MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)'},
-        ) as session:
-            async with session.get('https://commons.wikimedia.org/w/api.php', params=params, allow_redirects=False) as response:
-                if response.status != 200:
-                    raise ExternalServiceError('Источник фотографий сейчас недоступен. Попробуй позже.')
-                data = await response.json()
-        photos = candidates(data, place)
+        # Includes geocoder queue time; caller also limits photo delivery to 10 s.
+        return await asyncio.wait_for(fetch_photo(), timeout=8)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError) as exc:
         raise ExternalServiceError('Не удалось получить фото. Попробуй позже.') from exc
-    if not photos:
-        raise ExternalServiceError('В этот раз подходящего фото не нашлось. Запусти /geoguess ещё раз.')
-    return random.choice(photos)
