@@ -1,8 +1,9 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
+from aiogram.types import Message
 
 from common.externals import geoguess as source
 from common.externals.exceptions import ExternalServiceError
@@ -20,16 +21,25 @@ PHOTO = source.Photo(
 )
 
 
+def api_mock(name, **kwargs):
+    prototype = Message(message_id=1, date=0, chat={"id": 1, "type": "group"})
+    return create_autospec(getattr(prototype, name), **kwargs)
+
+
 def message(chat_id=1, message_id=100):
-    m = SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=message_id)
-    m.reply_photo = AsyncMock(return_value=message_stub(chat_id, message_id + 1))
-    m.reply = AsyncMock(return_value=message_stub(chat_id, message_id + 2))
+    m = message_stub(chat_id, message_id)
+    m.reply_photo = api_mock("reply_photo", return_value=message_stub(chat_id, message_id + 1))
+    m.reply = api_mock("reply", return_value=message_stub(chat_id, message_id + 2))
     return m
 
 
 def message_stub(chat_id, message_id):
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id), message_id=message_id, reply=AsyncMock(), edit_text=AsyncMock(), edit_caption=AsyncMock()
+        chat=SimpleNamespace(id=chat_id),
+        message_id=message_id,
+        reply=api_mock("reply"),
+        edit_text=api_mock("edit_text"),
+        edit_caption=api_mock("edit_caption"),
     )
 
 
@@ -448,5 +458,76 @@ def test_country_only_caption_has_no_empty_city():
         text = r.message.edit_caption.call_args.args[0]
         assert "<b>Норвегия</b>" in text
         assert "OpenStreetMap" in text
+
+    asyncio.run(scenario())
+
+
+def test_message_shortcuts_reject_unknown_timeout_argument():
+    with pytest.raises(TypeError):
+        message().reply("text", request_timeout=15)
+
+
+def test_telegram_deadline_cancels_request(monkeypatch):
+    monkeypatch.setattr(game, "SEND_TIMEOUT", 0.01)
+
+    async def scenario():
+        cancelled = asyncio.Event()
+
+        async def blocked():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await game.telegram(blocked())
+        assert cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_round_uses_real_aiogram_message_shortcuts(monkeypatch):
+    from aiogram import Bot
+
+    async def scenario():
+        bot = Bot("123456:" + "A" * 35)
+        Bot.set_current(bot)
+        counter = 100
+
+        async def request(method, data=None, files=None, **kwargs):
+            nonlocal counter
+            counter += 1
+            return {"message_id": counter, "date": 0, "chat": {"id": 1, "type": "group"}, "text": "test"}
+
+        transport = AsyncMock(side_effect=request)
+        monkeypatch.setattr(bot, "request", transport)
+        m = Message(message_id=1, date=0, chat={"id": 1, "type": "group"})
+        await game.Geoguess.process(m)
+        r = game.Geoguess.rounds[1]
+        await game.Geoguess.process(m)
+        q, data = query(r, r.options.index(PHOTO.country))
+        await game.Geoguess.process_cb(q, data)
+        await game.Geoguess.process_cb(*query(r, "finish"))
+        methods = [call.args[0] for call in transport.await_args_list]
+        assert "sendPhoto" in methods and "sendMessage" in methods
+        assert "editMessageText" in methods and "editMessageCaption" in methods
+        assert not game.Geoguess.rounds
+        # Also exercise both leaderboard branches and fetch failure with real shortcuts.
+        import sys
+        from types import ModuleType
+
+        app = ModuleType("app")
+        client = SimpleNamespace(zrevrange=AsyncMock(return_value=[(b"5", 1.0)]), hget=AsyncMock(return_value=b"Player"))
+        app.redis = SimpleNamespace(redis=AsyncMock(return_value=client))
+        monkeypatch.setitem(sys.modules, "app", app)
+        await game.Geoguess.top(m)
+        assert "Player" in transport.call_args.args[1]["text"]
+        client.zrevrange.side_effect = RuntimeError("offline")
+        await game.Geoguess.top(m)
+        assert transport.call_args.args[1]["text"] == "Рейтинг сейчас недоступен."
+        game.random_photo.side_effect = ExternalServiceError("offline")
+        await game.Geoguess.process(m)
+        assert transport.call_args.args[1]["text"] == "Ошибка, попробуйте еще раз"
+        assert not game.Geoguess.rounds
 
     asyncio.run(scenario())
