@@ -1,4 +1,6 @@
+import asyncio
 import io
+import json
 
 import aiogram
 import emoji
@@ -11,6 +13,7 @@ from aiogram.utils.markdown import hlink
 from common.tg.filters import MetaInfo
 from common.tg.utils import extract_image, download, download_by_file_id
 from common.utils import image_bytes_io, FakeBytesIO
+from utils.sticker_media import MAX_INPUT_BYTES, StickerMediaError, prepare_media
 
 sticker_set_name_template = 'with_love_for_{id}_by_msu_hub_bot'
 sticker_set_name_template_a = 'with_love_for_{id}a_by_msu_hub_bot'
@@ -59,6 +62,10 @@ class Stickers:
 
     @classmethod
     async def sticker_set_name(cls, message: Message, state: FSMContext):
+        data = await state.get_data()
+        if data.get('mixed_sticker'):
+            return await cls.finish_chat_set(message, state, data)
+
         title = message.text or message.caption or ''
         if not title:
             return await message.reply(f'🎈 Выберите подходящее название для стикерпака или тыкните /cancel')
@@ -119,6 +126,110 @@ class Stickers:
         ss = await message.bot.get_sticker_set(sticker_set_name)
         return await message.reply_sticker(ss.stickers[-1].file_id)
 
+    @staticmethod
+    def source_media(message):
+        # Prefer media attached to the command, then media in the replied message.
+        for target in (message, message.reply_to_message):
+            if not target:
+                continue
+            if target.sticker:
+                sticker = target.sticker
+                if getattr(sticker, 'type', 'regular') != 'regular':
+                    raise StickerMediaError('Пришлите обычный стикер, а не маску или custom emoji.')
+                kind = 'animated' if sticker.is_animated else 'video' if sticker.is_video else 'static'
+                return sticker, kind
+            if target.animation or target.video or target.video_note:
+                return target.animation or target.video or target.video_note, 'video'
+            if target.photo:
+                return target.photo[-1], 'static'
+            if target.document:
+                doc = target.document
+                mime = (doc.mime_type or '').lower()
+                if mime.startswith('video/') or mime == 'image/gif':
+                    return doc, 'video'
+                if mime.startswith('image/'):
+                    return doc, 'static'
+        return None, None
+
+    @classmethod
+    async def make_chat_sticker(cls, message, meta, state, name):
+        try:
+            source, kind = cls.source_media(message)
+            if source is None:
+                # Preserve the old avatar fallback only when no media was supplied.
+                _, source = await extract_image(message, with_profile_photo=True)
+                kind = 'static'
+            if source is None:
+                return await message.reply('Ответьте /sc на картинку, GIF, видео или стикер.')
+            if (source.file_size or 0) > MAX_INPUT_BYTES:
+                raise StickerMediaError('Файл больше 20 МБ. Стикер не добавлен.')
+            file = await download(source)
+            if file is None:
+                raise StickerMediaError('Не удалось скачать файл. Стикер не добавлен.')
+            # FFmpeg runs off the event loop. Its individual subprocesses have timeouts.
+            kind, payload = await asyncio.to_thread(prepare_media, file.getvalue(), kind)
+            emojis = list(dict.fromkeys(e['emoji'] for e in emoji.emoji_list(meta.extract_text()[1])))[:5] or ['✨']
+            suffix = {'static': 'webp', 'animated': 'tgs', 'video': 'webm'}[kind]
+            # Modern InputSticker supports mixed packs without migrating aiogram 2.
+            uploaded = await message.bot.request('uploadStickerFile', {
+                'user_id': message.from_user.id, 'sticker_format': kind,
+            }, files={'sticker': (f'sticker.{suffix}', io.BytesIO(payload))})
+            sticker = {'sticker': uploaded['file_id'], 'format': kind, 'emoji_list': emojis}
+            try:
+                await message.bot.get_sticker_set(name)
+            except aiogram.exceptions.InvalidStickersSet:
+                await state.update_data(mixed_sticker=sticker, sticker_set_name=name,
+                                        sticker_chat_id=message.chat.id, sticker_user_id=message.from_user.id)
+                await state.set_state(StickerStates.sticker_set_name.state)
+                return await message.reply('🎈 Пришлите название стикерпака (1–64 символа) или /cancel.')
+            await message.bot.request('addStickerToSet', {
+                'user_id': message.from_user.id, 'name': name,
+                'sticker': json.dumps(sticker, ensure_ascii=False),
+            })
+            return await message.reply_sticker(uploaded['file_id'])
+        except StickerMediaError as exc:
+            return await message.reply(str(exc))
+        except aiogram.exceptions.InvalidPeerID:
+            return await message.reply('Сначала начните личный чат со мной, затем повторите /sc.')
+        except aiogram.exceptions.BadRequest:
+            await message.reply('Не удалось добавить стикер. Подробнее в /error_stickers.')
+            raise
+
+    @classmethod
+    async def finish_chat_set(cls, message, state, data):
+        if (message.chat.id != data['sticker_chat_id']
+                or message.from_user.id != data['sticker_user_id']):
+            return await message.reply('Название должен прислать автор команды в том же чате.')
+        if not await can_edit_chat_stickers(message):
+            return await message.reply('Стикерпак чата могут редактировать только его админы.')
+        title = (message.text or message.caption or '').strip()
+        if not 1 <= len(title) <= 64:
+            return await message.reply('Название должно содержать от 1 до 64 символов. Или /cancel.')
+        name = data['sticker_set_name']
+        try:
+            # Another admin may have created the shared pack while we awaited a title.
+            try:
+                await message.bot.get_sticker_set(name)
+            except aiogram.exceptions.InvalidStickersSet:
+                await message.bot.request('createNewStickerSet', {
+                    'user_id': message.from_user.id, 'name': name, 'title': title,
+                    'stickers': json.dumps([data['mixed_sticker']], ensure_ascii=False),
+                    'sticker_type': 'regular',
+                })
+            else:
+                await message.bot.request('addStickerToSet', {
+                    'user_id': message.from_user.id, 'name': name,
+                    'sticker': json.dumps(data['mixed_sticker'], ensure_ascii=False),
+                })
+        except aiogram.exceptions.InvalidPeerID:
+            return await message.reply('Начните личный чат со мной и снова пришлите название.')
+        except aiogram.exceptions.BadRequest:
+            await message.reply('Не удалось сохранить стикер. Попробуйте ещё раз или /cancel. Подробнее в /error_stickers.')
+            raise
+        await state.finish()
+        await message.reply(hlink('✨ Стикерпак чата', f'https://t.me/addstickers/{name}'))
+        return await message.reply_sticker(data['mixed_sticker']['sticker'])
+
     @classmethod
     async def make_sticker_png(cls, message: Message, meta: MetaInfo, state: FSMContext, sticker_set_name: str):
         sticker = await cls.png(message)
@@ -137,17 +248,22 @@ async def process_sticker(message: Message, meta: MetaInfo, state: FSMContext):
     return await Stickers.make_sticker_png(message, meta, state, sticker_set_name)
 
 
+async def can_edit_chat_stickers(message):
+    if message.chat.type == ChatType.PRIVATE or not message.from_user or message.sender_chat:
+        return False
+    if message.chat.all_members_are_administrators:
+        return True
+    admins = await message.chat.get_administrators()
+    return message.from_user.id in (a.user.id for a in admins)
+
+
 async def process_sticker_chat(message: Message, meta: MetaInfo, state: FSMContext):
     if message.chat.type == ChatType.PRIVATE:
-        return await message.reply(f'🤷🏻‍♂️ Эта команда только для чатов')
-
-    if not message.chat.all_members_are_administrators:
-        admins = await message.chat.get_administrators()
-        if message.from_user.id not in (a.user.id for a in admins):
-            return await message.reply(f'🤷🏻‍♂️ Стикерпак чата могут редактировать только его админы')
-
-    sticker_set_name = sticker_set_name_template.format(id=abs(message.chat.id))
-    return await Stickers.make_sticker_png(message, meta, state, sticker_set_name)
+        return await message.reply('🤷🏻‍♂️ Эта команда только для чатов')
+    if not await can_edit_chat_stickers(message):
+        return await message.reply('🤷🏻‍♂️ Стикерпак чата могут редактировать только его админы')
+    name = sticker_set_name_template.format(id=abs(message.chat.id))
+    return await Stickers.make_chat_sticker(message, meta, state, name)
 
 
 async def process_animated_sticker(message: Message, meta: MetaInfo, state: FSMContext):
@@ -174,7 +290,7 @@ async def process_sticker_delete(message: Message):
     if not (sticker := target.sticker):
         return True
 
-    name = sticker.set_name
+    name = sticker.set_name or ''
     link = hlink('пака', f'https://t.me/addstickers/{name}')
 
     if not name.endswith('_by_msu_hub_bot'):
@@ -187,9 +303,9 @@ async def process_sticker_delete(message: Message):
 
     if name in (sticker_set_name_template.format(id=abs(message.chat.id)),
                 sticker_set_name_template_a.format(id=abs(message.chat.id))):
-        admins = await message.chat.get_administrators()
-        if message.from_user.id not in (a.user.id for a in admins):
+        if not await can_edit_chat_stickers(message):
             return await message.reply(f'🤷🏻‍♂️ Стикерпак чата могут редактировать только его админы')
+        # Telegram deletes static, TGS and WEBM stickers by the same file_id.
         await sticker.delete_from_set()
         return await message.reply(f'✅ Стикер удален из {link}, в течение часа он пропадет из набора у всех пользователей')
 
