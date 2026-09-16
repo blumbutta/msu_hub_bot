@@ -261,3 +261,46 @@ def test_creation_reuses_concurrently_created_pack(handlers):
     asyncio.run(handlers["Stickers"].finish_chat_set(m, state, data))
     assert m.bot.request.call_args.args[0] == "addStickerToSet"
     state.finish.assert_awaited_once()
+
+
+def test_oversized_video_is_encoded_once(monkeypatch):
+    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264"}, 6))
+    calls = []
+
+    def encode(command):
+        calls.append(command)
+        Path(command[-1]).write_bytes(b"x" * (media.MAX_VIDEO_BYTES + 1))
+
+    monkeypatch.setattr(media, "_run", encode)
+    with pytest.raises(media.StickerMediaError, match="одной попытки"):
+        media.prepare_video(b"video")
+    assert len(calls) == 1
+
+
+def test_encoder_failure_is_not_retried(monkeypatch):
+    monkeypatch.setattr(media, "_probe", lambda path: ({}, {"codec_name": "h264"}, 6))
+    calls = []
+
+    def fail(command):
+        calls.append(command)
+        raise media.StickerMediaError("Ошибка кодирования")
+
+    monkeypatch.setattr(media, "_run", fail)
+    with pytest.raises(media.StickerMediaError, match="Ошибка кодирования"):
+        media.prepare_video(b"video")
+    assert len(calls) == 1
+
+
+def test_oversized_static_is_encoded_once(monkeypatch):
+    source = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(source, format="PNG")
+    calls = []
+
+    def save(image, output, **kwargs):
+        calls.append(kwargs)
+        output.write(b"x" * (512 * 1024 + 1))
+
+    monkeypatch.setattr(Image.Image, "save", save)
+    with pytest.raises(media.StickerMediaError, match="одной попытки"):
+        media.prepare_static(source.getvalue())
+    assert len(calls) == 1
