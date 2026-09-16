@@ -2,6 +2,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from itertools import permutations
 from typing import Final, Tuple
 
 import pendulum
@@ -113,8 +114,13 @@ async def process_puk(_message: Message, meta: MetaInfo):
     if not text:
         return True
 
-    text, n = re.subn(r'(пу\w?)|(п\w?к)|(\w?ук)', 'пук', text)
-    text, m = re.subn(r'(пер\w?)|(пе\w?д)|(п\w?рд)|(\w?ерд)', 'перд', text)
-    if n or m:
+    puk_variants = '|'.join(''.join(p) for p in permutations('куп'))
+    perd_variants = '|'.join(''.join(p) for p in permutations('епрд'))
+    kal_variants = '|'.join(''.join(p) for p in permutations('кал'))
+
+    text, n = re.subn(rf'{puk_variants}|(пу\w?)|(п\w?к)|(\w?ук)', 'пук', text)
+    text, m = re.subn(rf'{perd_variants}|(пер\w?)|(пе\w?д)|(п\w?рд)|(\w?ерд)', 'перд', text)
+    text, k = re.subn(rf'{kal_variants}|(ка\w?)|(к\w?л)|(\w?ал)', 'кал', text)
+    if n or m or k:
         return await target.reply(text)
     return True
