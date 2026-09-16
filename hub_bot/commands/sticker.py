@@ -1,4 +1,3 @@
-import asyncio
 import io
 import json
 
@@ -10,6 +9,7 @@ from aiogram.dispatcher.filters.state import StatesGroup, State
 from aiogram.types import Message, ChatType
 from aiogram.utils.markdown import hlink
 
+from app import cpu_executor
 from common.tg.filters import MetaInfo
 from common.tg.utils import extract_image, download, download_by_file_id
 from common.utils import image_bytes_io, FakeBytesIO
@@ -149,6 +149,7 @@ class Stickers:
                     return doc, 'video'
                 if mime.startswith('image/'):
                     return doc, 'static'
+                raise StickerMediaError('Формат файла не поддерживается. Пришлите картинку, GIF, видео или готовый Telegram-стикер.')
         return None, None
 
     @classmethod
@@ -166,8 +167,11 @@ class Stickers:
             file = await download(source)
             if file is None:
                 raise StickerMediaError('Не удалось скачать файл. Стикер не добавлен.')
-            # FFmpeg runs off the event loop. Its individual subprocesses have timeouts.
-            kind, payload = await asyncio.to_thread(prepare_media, file.getvalue(), kind)
+            # Share the app's worker limit and shutdown lifecycle with other media jobs.
+            prepared, timeouted = await cpu_executor.run(prepare_media, file.getvalue(), kind)
+            if timeouted:
+                raise StickerMediaError('Обработка заняла слишком много времени. Стикер не добавлен.')
+            kind, payload = prepared
             emojis = list(dict.fromkeys(e['emoji'] for e in emoji.emoji_list(meta.extract_text()[1])))[:5] or ['✨']
             suffix = {'static': 'webp', 'animated': 'tgs', 'video': 'webm'}[kind]
             # Modern InputSticker supports mixed packs without migrating aiogram 2.

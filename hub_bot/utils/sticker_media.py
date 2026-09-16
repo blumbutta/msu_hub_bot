@@ -77,10 +77,11 @@ def prepare_video(data):
         factor = speed_factor(duration)
         # Preserve alpha when decoding existing VP9 video stickers.
         decoder = ["-c:v", "libvpx-vp9"] if video.get("codec_name") == "vp9" else []
+        # Preserve display proportions before changing the pixel aspect ratio to 1.
         filters = (
             f"setpts=(PTS-STARTPTS)/{factor:.12f},"
-            "scale=w='if(gte(iw,ih),512,max(2,trunc(iw*512/ih/2)*2))':"
-            "h='if(gte(iw,ih),max(2,trunc(ih*512/iw/2)*2),512)',"
+            "scale=w='if(gte(dar,1),512,max(2,trunc(512*dar/2)*2))':"
+            "h='if(gte(dar,1),max(2,trunc(512/dar/2)*2),512)',"
             "setsar=1,fps=30:round=down,format=yuva420p"
         )
         _run(
@@ -182,7 +183,7 @@ def prepare_media(data, kind):
         return "video", prepare_video(data)
     try:
         return prepare_static(data)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
         if isinstance(exc, StickerMediaError):
             raise
         raise StickerMediaError("Не удалось прочитать картинку.") from exc

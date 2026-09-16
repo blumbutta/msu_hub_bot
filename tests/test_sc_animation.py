@@ -6,6 +6,8 @@ import gzip
 import importlib.util
 import io
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,10 +26,15 @@ def handlers():
     # Load the actual module, substituting only unrelated application imports.
     source = (ROOT / "hub_bot/commands/sticker.py").read_text()
     tree = ast.parse(source)
-    tree.body = [n for n in tree.body if not isinstance(n, ast.ImportFrom) or not n.module.startswith(("common.", "utils."))]
+    tree.body = [
+        n for n in tree.body if not isinstance(n, ast.ImportFrom) or (n.module != "app" and not n.module.startswith(("common.", "utils.")))
+    ]
 
     async def download(file):
         return io.BytesIO(file.data)
+
+    async def execute(function, *args):
+        return function(*args), False
 
     ns = dict(
         MetaInfo=object,
@@ -38,6 +45,7 @@ def handlers():
         extract_image=AsyncMock(return_value=(None, None)),
         image_bytes_io=None,
         FakeBytesIO=io.BytesIO,
+        cpu_executor=SimpleNamespace(run=AsyncMock(side_effect=execute)),
     )
     exec(compile(tree, "<sticker>", "exec"), ns)
     return ns
@@ -193,9 +201,18 @@ def test_upload_and_add_modern_api(handlers, kind):
     handlers["prepare_media"] = lambda data, kind: (kind, b"prepared")
     meta = SimpleNamespace(extract_text=lambda: (m, "😎"))
     asyncio.run(handlers["process_sticker_chat"](m, meta, None))
+    handlers["cpu_executor"].run.assert_awaited_once_with(handlers["prepare_media"], b"data", kind)
     calls = m.bot.request.call_args_list
     assert [c.args[0] for c in calls] == ["uploadStickerFile", "addStickerToSet"]
     assert json.loads(calls[1].args[1]["sticker"]) == dict(sticker="uploaded", format=kind, emoji_list=["😎"])
+
+
+def test_executor_timeout_never_uploads(handlers):
+    m = message(kind="video")
+    handlers["cpu_executor"].run = AsyncMock(return_value=(None, True))
+    asyncio.run(handlers["process_sticker_chat"](m, None, None))
+    m.bot.request.assert_not_awaited()
+    assert "слишком много времени" in m.reply.call_args.args[0]
 
 
 def test_new_pack_preserves_prepared_video(handlers):
@@ -304,3 +321,86 @@ def test_oversized_static_is_encoded_once(monkeypatch):
     with pytest.raises(media.StickerMediaError, match="одной попытки"):
         media.prepare_static(source.getvalue())
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("mime", ["application/x-tgsticker", "application/json", "application/octet-stream"])
+def test_unsupported_document_never_uses_avatar(handlers, mime):
+    m = message()
+    m.reply_to_message.sticker = None
+    m.reply_to_message.document = SimpleNamespace(mime_type=mime)
+    asyncio.run(handlers["process_sticker_chat"](m, None, None))
+    handlers["extract_image"].assert_not_awaited()
+    m.bot.request.assert_not_awaited()
+    assert m.reply.call_count == 1
+
+
+def test_decompression_bomb_becomes_media_error(monkeypatch):
+    source = io.BytesIO()
+    Image.new("RGB", (20, 20)).save(source, format="PNG")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    with pytest.raises(media.StickerMediaError, match="картинку"):
+        media.prepare_media(source.getvalue(), "static")
+
+
+@pytest.mark.parametrize("kind", ["static", "animated", "video"])
+def test_input_byte_limit_applies_before_decoding(kind):
+    with pytest.raises(media.StickerMediaError, match="20 МБ"):
+        media.prepare_media(b"x" * (media.MAX_INPUT_BYTES + 1), kind)
+
+
+def test_oversized_metadata_rejected_before_download(handlers):
+    m = message(kind="video")
+    m.reply_to_message.sticker.file_size = media.MAX_INPUT_BYTES + 1
+    handlers["download"] = AsyncMock()
+    asyncio.run(handlers["process_sticker_chat"](m, None, None))
+    handlers["download"].assert_not_awaited()
+    handlers["cpu_executor"].run.assert_not_awaited()
+    m.bot.request.assert_not_awaited()
+
+
+@pytest.mark.parametrize("data", [b"x" * (64 * 1024 + 1), gzip.compress(b"x" * (2 * 1024 * 1024 + 1))])
+def test_tgs_compressed_and_expanded_limits(data):
+    with pytest.raises(media.StickerMediaError):
+        media.prepare_tgs(data)
+
+
+def test_subprocess_deadline_becomes_media_error(monkeypatch):
+    def time_out(command, **kwargs):
+        assert kwargs == dict(check=True, capture_output=True, timeout=60)
+        raise subprocess.TimeoutExpired(command, 60)
+
+    monkeypatch.setattr(media.subprocess, "run", time_out)
+    with pytest.raises(media.StickerMediaError, match="слишком много времени"):
+        media._run(["ffmpeg", "synthetic-input"])
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg and FFprobe required")
+@pytest.mark.parametrize("sar,expected_size", [("2/1", (512, 192)), ("1/2", (340, 512))])
+def test_video_preserves_display_aspect_ratio(tmp_path, sar, expected_size):
+    source = tmp_path / "anamorphic.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x120:r=30:d=0.2",
+            "-vf",
+            f"setsar={sar}",
+            "-c:v",
+            "libx264",
+            "-y",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    output = tmp_path / "sticker.webm"
+    output.write_bytes(media.prepare_video(source.read_bytes()))
+    _, stream, duration = media._probe(output)
+    assert (stream["width"], stream["height"]) == expected_size
+    assert stream["sample_aspect_ratio"] == "1:1"
+    assert 0 < duration <= 3
