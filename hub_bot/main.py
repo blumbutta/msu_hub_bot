@@ -42,6 +42,7 @@ from commands.externals import process_badwiki, process_toonify, process_bg, pro
 from commands.figlet import process_figlet
 from commands.fun import process_beer, process_pokakats, process_puk
 from commands.genders import process_gender
+from commands.geoguess import Geoguess
 from commands.help import HelpMessage
 from commands.infra import process_create_infra_chat, process_delete_infra_chat, process_inline, process_links, \
     process_pin, \
@@ -345,6 +346,9 @@ async def on_startup(dp: Dispatcher):
     dp.register_message_handler(process_figlet, MetaCommand('figlet'))
     dp.register_message_handler(process_excuse, MetaCommand('excuse', 'e'))
     dp.register_message_handler(process_gender, MetaCommand('gender', 'g'))
+    dp.register_message_handler(Geoguess.process, MetaCommand('geoguess'))
+    dp.register_message_handler(Geoguess.top, MetaCommand('geoguess_top'))
+    dp.register_callback_query_handler(Geoguess.process_cb, Geoguess.callback_data.filter())
     dp.register_message_handler(process_me, MetaCommand('me'))
     dp.register_message_handler(process_copy, MetaCommand('copy', 'see', 'uncover'))
     dp.register_message_handler(process_arxiv, commands=['arxiv'])
@@ -378,6 +382,7 @@ async def on_startup(dp: Dispatcher):
 
 
 async def on_shutdown(_dp: Dispatcher):
+    await Geoguess.shutdown()
     await app.on_shutdown_all()
 
 
