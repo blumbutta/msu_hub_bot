@@ -9,6 +9,7 @@ import aiohttp
 import websockets
 
 from common import json
+from common.externals.animegan import mask_anime2  # noqa: F401 (public re-export)
 from common.externals.exceptions import BadRequestError
 from common.utils import retry_async_, bytes_io_to_base64, base64_to_bytes_io
 
@@ -59,17 +60,6 @@ async def hg(file: io.BytesIO, repo: str, additional_data: List[str] = None) -> 
         'data': [bytes_io_to_base64(file)] + additional_data,
     }
     result = await hg_base(repo, data)
-    return base64_to_bytes_io(result['data'][0])
-
-
-async def mask_anime2(file: io.BytesIO) -> io.BytesIO:
-    data = {
-        'action': 'predict',
-        'data': [bytes_io_to_base64(file), 'version 2 (🔺 robustness,🔻 stylization)'],
-        'fn_index': 0,
-        'session_hash': '61lmllpjsji',
-    }
-    result = await hg_base('akhaliq/AnimeGANv2', data)
     return base64_to_bytes_io(result['data'][0])
 
 
