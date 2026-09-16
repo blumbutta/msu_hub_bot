@@ -1218,6 +1218,25 @@
   },
   {
     "type": "register_message_handler",
+    "handler": "Geoguess.process",
+    "aliases": [
+      "geoguess"
+    ]
+  },
+  {
+    "type": "register_message_handler",
+    "handler": "Geoguess.top",
+    "aliases": [
+      "geoguess_top"
+    ]
+  },
+  {
+    "type": "register_callback_query_handler",
+    "handler": "Geoguess.process_cb",
+    "aliases": []
+  },
+  {
+    "type": "register_message_handler",
     "handler": "process_me",
     "aliases": [
       "me"
