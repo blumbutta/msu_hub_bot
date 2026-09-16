@@ -11,7 +11,7 @@ from aiogram.utils.callback_data import CallbackData
 from aiogram.utils.exceptions import TelegramAPIError
 
 from common.externals.exceptions import ExternalServiceError
-from common.externals.geoguess import PLACES, Photo, random_photo
+from common.externals.geoguess import COUNTRIES, Photo, random_photo
 
 logger = logging.getLogger(__name__)
 SEND_TIMEOUT = 15
@@ -84,7 +84,7 @@ class Geoguess:
     @classmethod
     async def send_round_photo(cls, message, round_):
         photo = await random_photo()
-        options = random.sample(sorted({place[0] for place in PLACES} - {photo.country}), 3) + [photo.country]
+        options = random.sample(sorted(set(COUNTRIES.values()) - {photo.country}), 3) + [photo.country]
         random.shuffle(options)
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(*[
@@ -180,9 +180,11 @@ class Geoguess:
             except Exception:
                 scored = False
                 logger.exception('Geoguess score update failed')
+            place = ', '.join(part for part in (photo.city, photo.country) if part)
             result = (
-                f'🌍 На снимке — <b>{escape(photo.city)}, {escape(photo.country)}</b>.\n\n'
-                f'{credit(photo)}\n<a href="{photo.source}">Источник фотографии</a>\n\n'
+                f'🌍 На снимке — <b>{escape(place)}</b>.\n\n'
+                f'{credit(photo)}\n<a href="{photo.source}">Источник фотографии</a>\n'
+                'Геоданные: <a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>\n\n'
             )
             if winners:
                 mentions = [
