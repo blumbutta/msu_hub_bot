@@ -35,6 +35,11 @@ class Round:
     board_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+async def telegram(operation):
+    """Bound aiogram 2.x shortcuts without unsupported timeout keywords."""
+    return await asyncio.wait_for(operation, timeout=SEND_TIMEOUT)
+
+
 def credit(photo):
     return f'Фото: {escape(photo.author)}, <a href="{escape(photo.license_url, quote=True)}">{escape(photo.license)}</a>.'
 
@@ -63,9 +68,9 @@ class Geoguess:
     async def process(cls, message: Message):
         chat_id = message.chat.id
         if chat_id in cls.rounds:
-            return await message.reply('Подождите, прошлое задание еще не окончено!', request_timeout=SEND_TIMEOUT)
+            return await telegram(message.reply('Подождите, прошлое задание еще не окончено!'))
         if len(cls.rounds) >= MAX_ROUNDS:
-            return await message.reply('Сейчас слишком много игр. Попробуй немного позже.', request_timeout=SEND_TIMEOUT)
+            return await telegram(message.reply('Сейчас слишком много игр. Попробуй немного позже.'))
         round_ = Round(secrets.token_hex(6))
         cls.rounds[chat_id] = round_
         started = False
@@ -76,7 +81,7 @@ class Geoguess:
         except (ExternalServiceError, TelegramAPIError, asyncio.TimeoutError):
             if cls.rounds.get(chat_id) is round_:
                 cls.rounds.pop(chat_id, None)
-            await message.reply('Ошибка, попробуйте еще раз', request_timeout=SEND_TIMEOUT)
+            await telegram(message.reply('Ошибка, попробуйте еще раз'))
         finally:
             if not started and cls.rounds.get(chat_id) is round_:
                 cls.rounds.pop(chat_id, None)
@@ -93,10 +98,10 @@ class Geoguess:
         ])
         keyboard.row(InlineKeyboardButton('Завершить задание', callback_data=cls.callback_data.new(round_.token, 'finish')))
         round_.photo, round_.options = photo, options
-        round_.message = await message.reply_photo(
+        round_.message = await telegram(message.reply_photo(
             photo.url,
-            reply_markup=keyboard, request_timeout=SEND_TIMEOUT,
-        )
+            reply_markup=keyboard,
+        ))
 
     @classmethod
     async def process_cb(cls, query: CallbackQuery, callback_data: dict):
@@ -149,20 +154,20 @@ class Geoguess:
                 for i, text in enumerate(chunks):
                     boards = ([round_.board] if round_.board is not None else []) + round_.board_more
                     if i >= len(boards):
-                        board = await round_.message.reply(text, parse_mode='HTML', request_timeout=SEND_TIMEOUT)
+                        board = await telegram(round_.message.reply(text, parse_mode='HTML'))
                         if i == 0:
                             round_.board = board
                         else:
                             round_.board_more.append(board)
                         round_.board_texts.append(text)
                     elif round_.board_texts[i] != text:
-                        await boards[i].edit_text(text, parse_mode='HTML', request_timeout=SEND_TIMEOUT)
+                        await telegram(boards[i].edit_text(text, parse_mode='HTML'))
                         round_.board_texts[i] = text
                 # A shorter final heading can occasionally reduce the number of pages.
                 boards = ([round_.board] if round_.board is not None else []) + round_.board_more
                 for i in range(len(chunks), len(boards)):
                     if round_.board_texts[i] != 'Список ответов выше.':
-                        await boards[i].edit_text('Список ответов выше.', request_timeout=SEND_TIMEOUT)
+                        await telegram(boards[i].edit_text('Список ответов выше.'))
                         round_.board_texts[i] = 'Список ответов выше.'
             except (TelegramAPIError, asyncio.TimeoutError):
                 logger.warning('Geoguess vote board update failed')
@@ -210,11 +215,11 @@ class Geoguess:
                 winner_messages = []
                 result += 'Никто не угадал 😄' if round_.votes else 'В этот раз никто не ответил.'
             try:
-                await round_.message.edit_caption(result, parse_mode='HTML', reply_markup=None, request_timeout=SEND_TIMEOUT)
+                await telegram(round_.message.edit_caption(result, parse_mode='HTML', reply_markup=None))
             except (TelegramAPIError, asyncio.TimeoutError):
-                await round_.message.reply(result, parse_mode='HTML', disable_web_page_preview=True, request_timeout=SEND_TIMEOUT)
+                await telegram(round_.message.reply(result, parse_mode='HTML', disable_web_page_preview=True))
             for text in winner_messages:
-                await round_.message.reply(text, parse_mode='HTML', disable_web_page_preview=True, request_timeout=SEND_TIMEOUT)
+                await telegram(round_.message.reply(text, parse_mode='HTML', disable_web_page_preview=True))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -241,9 +246,9 @@ class Geoguess:
         try:
             rows = await asyncio.wait_for(read(), timeout=5)
         except Exception:
-            return await message.reply('Рейтинг сейчас недоступен.', request_timeout=SEND_TIMEOUT)
+            return await telegram(message.reply('Рейтинг сейчас недоступен.'))
         text = '🏆 Рейтинг чата\n\n' + ('\n'.join(rows) if rows else 'Пока нет очков. Начни /geoguess')
-        return await message.reply(text, parse_mode='HTML', request_timeout=SEND_TIMEOUT)
+        return await telegram(message.reply(text, parse_mode='HTML'))
 
     @classmethod
     async def shutdown(cls):
