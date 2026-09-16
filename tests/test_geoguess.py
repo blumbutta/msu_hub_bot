@@ -200,23 +200,25 @@ def sample():
 
 
 def test_geography_author_license():
-    result = source.candidates(sample(), source.PLACES[0])
+    result = source.candidates(sample())
     assert len(result) == 1
-    assert result[0].author == "Alice & Bob"
-    assert result[0].country == "Норвегия"
+    assert result[0].photo.author == "Alice & Bob"
+    assert result[0].latitude == 60.397
+    assert result[0].longitude == 5.325
+    assert result[0].photo.country == ""
 
 
 @pytest.mark.parametrize("field,value", [("mime", "image/svg+xml"), ("width", 40), ("url", "https://evil.example/x")])
 def test_unsuitable_media_filtered(field, value):
     data = sample()
     data["query"]["pages"]["1"]["imageinfo"][0][field] = value
-    assert source.candidates(data, source.PLACES[0]) == []
+    assert source.candidates(data) == []
 
 
-def test_distant_location_filtered():
+def test_invalid_location_filtered():
     data = sample()
-    data["query"]["pages"]["1"]["imageinfo"][0]["extmetadata"]["GPSLatitude"]["value"] = "0"
-    assert source.candidates(data, source.PLACES[0]) == []
+    data["query"]["pages"]["1"]["imageinfo"][0]["extmetadata"]["GPSLatitude"]["value"] = "nan"
+    assert source.candidates(data) == []
 
 
 def test_score_storage_and_top(monkeypatch):
@@ -361,5 +363,90 @@ def test_fetch_and_send_share_one_deadline(monkeypatch):
         await game.Geoguess.process(m)
         assert not game.Geoguess.rounds
         assert m.reply.call_args.args[0] == "Ошибка, попробуйте еще раз"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("latitude,longitude", [(0, 0), (-33.9, 18.4), (27.7, 85.3), (-17.7, 178.4)])
+def test_coordinates_worldwide_are_not_restricted(latitude, longitude):
+    data = sample()
+    metadata = data["query"]["pages"]["1"]["imageinfo"][0]["extmetadata"]
+    metadata["GPSLatitude"]["value"] = str(latitude)
+    metadata["GPSLongitude"]["value"] = str(longitude)
+    assert len(source.candidates(data)) == 1
+
+
+def test_country_uses_code_not_untrusted_display_name():
+    assert source.location({"address": {"country_code": "np", "country": "Nepal", "city": "Катманду"}}) == ("Непал", "Катманду")
+    assert len(source.COUNTRIES) > 200
+
+
+@pytest.mark.parametrize("data", [{}, {"error": "Unable to geocode"}, {"address": {"country": "Atlantis", "country_code": "zz"}}])
+def test_unknown_country_rejected(data):
+    with pytest.raises(source.UnknownLocation):
+        source.location(data)
+
+
+def test_unknown_photo_skipped_before_delivery(monkeypatch):
+    import copy
+
+    data = sample()
+    second = copy.deepcopy(data["query"]["pages"]["1"])
+    second["pageid"] = 2
+    data["query"]["pages"]["2"] = second
+    monkeypatch.setattr(source.random, "shuffle", lambda photos: None)
+    fetch = AsyncMock(return_value=data)
+    reverse = AsyncMock(side_effect=[source.UnknownLocation("unknown"), ("Непал", "Катманду")])
+    monkeypatch.setattr(source, "request_json", fetch)
+    monkeypatch.setattr(source, "reverse_location", reverse)
+    photo = asyncio.run(source.random_photo())
+    assert photo.country == "Непал" and photo.source.endswith("curid=2")
+    params = fetch.call_args.args[2]
+    assert params["generator"] == "random" and params["grnnamespace"] == 6
+    assert "gsrsearch" not in params and "ggscoord" not in params
+    assert reverse.await_count == 2
+
+
+def test_no_country_means_no_photo(monkeypatch):
+    monkeypatch.setattr(source, "request_json", AsyncMock(return_value=sample()))
+    monkeypatch.setattr(source, "reverse_location", AsyncMock(side_effect=source.UnknownLocation("unknown")))
+    with pytest.raises(ExternalServiceError):
+        asyncio.run(source.random_photo())
+
+
+def test_geocoder_cache_and_throttle(monkeypatch):
+    monkeypatch.setattr(source, "_geocoder_lock", None)
+    monkeypatch.setattr(source, "_geocoder_next", 0)
+    monkeypatch.setattr(source, "_geocoder_cache", {})
+    request = AsyncMock(return_value={"address": {"country_code": "np", "country": "Nepal"}})
+    monkeypatch.setattr(source, "request_json", request)
+    starts = []
+
+    async def record(*args):
+        starts.append(source.time.monotonic())
+        return {"address": {"country_code": "np", "country": "Nepal"}}
+
+    request.side_effect = record
+
+    async def scenario():
+        await asyncio.gather(source.reverse_location(None, 27, 85), source.reverse_location(None, 28, 85))
+        await source.reverse_location(None, 27, 85)
+
+    asyncio.run(scenario())
+    assert request.await_count == 2
+    assert starts[1] - starts[0] >= 1
+
+
+def test_country_only_caption_has_no_empty_city():
+    async def scenario():
+        from dataclasses import replace
+
+        game.random_photo.return_value = replace(PHOTO, city="")
+        await game.Geoguess.process(message())
+        r = game.Geoguess.rounds[1]
+        await game.Geoguess.process_cb(*query(r, "finish"))
+        text = r.message.edit_caption.call_args.args[0]
+        assert "<b>Норвегия</b>" in text
+        assert "OpenStreetMap" in text
 
     asyncio.run(scenario())
