@@ -83,57 +83,56 @@ def prepare_video(data):
             "h='if(gte(iw,ih),max(2,trunc(ih*512/iw/2)*2),512)',"
             "setsar=1,fps=30:round=down,format=yuva420p"
         )
-        for crf in (32, 40, 48, 56, 63):
-            _run(
-                [
-                    "ffmpeg",
-                    "-nostdin",
-                    "-v",
-                    "error",
-                    "-y",
-                    *decoder,
-                    "-i",
-                    str(source),
-                    "-map",
-                    "0:v:0",
-                    "-an",
-                    "-sn",
-                    "-dn",
-                    "-vf",
-                    filters,
-                    "-c:v",
-                    "libvpx-vp9",
-                    "-b:v",
-                    "0",
-                    "-crf",
-                    str(crf),
-                    "-deadline",
-                    "good",
-                    "-cpu-used",
-                    "4",
-                    "-threads",
-                    "2",
-                    "-auto-alt-ref",
-                    "0",
-                    str(output),
-                ]
-            )
-            if output.stat().st_size <= MAX_VIDEO_BYTES:
-                info, result, length = _probe(output)
-                width, height = result["width"], result["height"]
-                fps_num, fps_den = result.get("avg_frame_rate", "0/1").split("/")
-                fps = float(fps_num) / float(fps_den or 1)
-                if (
-                    not 0 < length <= 3
-                    or max(width, height) != 512
-                    or min(width, height) <= 0
-                    or not 0 < fps <= 30
-                    or result.get("codec_name") != "vp9"
-                    or any(s.get("codec_type") == "audio" for s in info["streams"])
-                ):
-                    raise StickerMediaError("Результат не соответствует ограничениям Telegram.")
-                return output.read_bytes()
-        raise StickerMediaError("Не удалось уменьшить стикер до 256 КБ. Стикер не добавлен.")
+        _run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                *decoder,
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                filters,
+                "-c:v",
+                "libvpx-vp9",
+                "-b:v",
+                "0",
+                "-crf",
+                "32",
+                "-deadline",
+                "good",
+                "-cpu-used",
+                "4",
+                "-threads",
+                "2",
+                "-auto-alt-ref",
+                "0",
+                str(output),
+            ]
+        )
+        if output.stat().st_size <= MAX_VIDEO_BYTES:
+            info, result, length = _probe(output)
+            width, height = result["width"], result["height"]
+            fps_num, fps_den = result.get("avg_frame_rate", "0/1").split("/")
+            fps = float(fps_num) / float(fps_den or 1)
+            if (
+                not 0 < length <= 3
+                or max(width, height) != 512
+                or min(width, height) <= 0
+                or not 0 < fps <= 30
+                or result.get("codec_name") != "vp9"
+                or any(s.get("codec_type") == "audio" for s in info["streams"])
+            ):
+                raise StickerMediaError("Результат не соответствует ограничениям Telegram.")
+            return output.read_bytes()
+        raise StickerMediaError("После одной попытки сжатия стикер превышает 256 КБ. Стикер не добавлен.")
 
 
 def prepare_static(data):
@@ -147,10 +146,7 @@ def prepare_static(data):
         output = io.BytesIO()
         image.save(output, format="WEBP", lossless=True)
         if output.tell() > 512 * 1024:
-            output = io.BytesIO()
-            image.save(output, format="WEBP", quality=90, method=6)
-        if output.tell() > 512 * 1024:
-            raise StickerMediaError("Не удалось уменьшить размер картинки.")
+            raise StickerMediaError("После одной попытки сжатия картинка превышает 512 КБ. Стикер не добавлен.")
         return "static", output.getvalue()
 
 
