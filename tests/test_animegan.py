@@ -10,9 +10,7 @@ from PIL import Image
 
 from common.externals.exceptions import ExternalServiceError
 
-spec = importlib.util.spec_from_file_location(
-    "animegan", Path(__file__).resolve().parents[1] / "common/externals/animegan.py"
-)
+spec = importlib.util.spec_from_file_location("animegan", Path(__file__).resolve().parents[1] / "common/externals/animegan.py")
 animegan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(animegan)
 
@@ -120,9 +118,7 @@ def test_oversized_result():
             run(setup_responses() + [Response(body=b"123")])
 
 
-@pytest.mark.parametrize(
-    "error", [asyncio.TimeoutError(), aiohttp.ClientConnectionError()]
-)
+@pytest.mark.parametrize("error", [asyncio.TimeoutError(), aiohttp.ClientConnectionError()])
 def test_network_failure(error):
     async def fail(file):
         raise error
