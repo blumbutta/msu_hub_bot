@@ -13,7 +13,7 @@ from gino import Gino
 from sqlalchemy import text
 
 from common.config import ConfigBase
-from common.executor import PPExecutor
+from common.executor import TPExecutor
 from common.hc import HealthCheck
 from common.logger import LoggerBuilder
 from common.mixins import LoggerMixin
@@ -79,10 +79,10 @@ class AppLogger(AppBase):
 
 @dataclass
 class AppCPUExecutor(AppBase):
-    cpu_executor: PPExecutor = None
+    cpu_executor: TPExecutor = None
 
     def init(self):
-        self.cpu_executor = PPExecutor(max_workers=3)
+        self.cpu_executor = TPExecutor(max_workers=3)
 
     async def on_shutdown(self):
         self.cpu_executor.shutdown(wait=False)
