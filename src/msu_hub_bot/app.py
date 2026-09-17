@@ -43,6 +43,7 @@ from msu_hub_bot.telegram.storage import RedisStorage
 from msu_hub_bot.telegram.wrapper import BotWrapper
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.commands.geoguess import Geoguess
+from msu_hub_bot.commands.chess import Chess
 from msu_hub_bot.events import EcosystemManager, EventsMiddleware
 from msu_hub_bot.routing import build_router
 from msu_hub_bot.providers.jdoodle import ManyJDoodle
@@ -132,6 +133,7 @@ class Application:
             preferences = SettingsMiddleware(database, telemetry=telemetry, backend=backend)
             stack.push_async_callback(preferences.close)
             stack.push_async_callback(Geoguess.shutdown)
+            stack.push_async_callback(Chess.shutdown)
             ecosystem = EcosystemManager(bot, database)
             events = EventsMiddleware(bot, database, settings.events_chat_id, em=ecosystem)
 
