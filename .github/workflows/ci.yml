@@ -52,6 +52,15 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -68,6 +77,11 @@ jobs:
         run: uv run --no-sync pytest -q tests/test_postgres_storage.py
         env:
           HUB_TEST_POSTGRES_DSN: postgresql://postgres:test-only-postgres@localhost:5432/hub_test_ci
+
+      - name: Exercise GeoGuess scoring and replay protection
+        run: uv run --no-sync pytest -q tests/test_geoguess_redis.py
+        env:
+          HUB_TEST_REDIS_URL: redis://127.0.0.1:6379/0
 
   security:
     name: Secrets and workflows
