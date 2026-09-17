@@ -64,6 +64,7 @@ def query(round_, choice, user_id=5):
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     game.Geoguess.rounds = {}
+    monkeypatch.setattr(game.Geoguess, "recent_countries", game.LRUCache(maxsize=1024))
     monkeypatch.setattr(game, "today", lambda: date(2026, 9, 17))
 
     async def send(method):
@@ -105,7 +106,7 @@ def test_loading_reserves_chat_and_other_chat_is_independent():
         loading = asyncio.Event()
         release = asyncio.Event()
 
-        async def fetch():
+        async def fetch(recent_countries):
             loading.set()
             await release.wait()
             return PHOTO
@@ -436,7 +437,7 @@ def test_fetch_and_send_share_one_deadline(monkeypatch):
     monkeypatch.setattr(game, "PHOTO_TIMEOUT", 0.04)
 
     async def scenario():
-        async def fetch():
+        async def fetch(recent_countries):
             await asyncio.sleep(0.025)
             return PHOTO
 
@@ -614,5 +615,57 @@ def test_failed_loser_penalty_is_reported_even_with_no_winners():
         result = round_.message.edit_caption.call_args.kwargs["caption"]
         assert "Не удалось подтвердить запись очков" in result
         assert "Норвегия" in result and not game.Geoguess.rounds
+
+    asyncio.run(scenario())
+
+
+def test_recent_countries_follow_last_fifteen_delivered_photos_per_chat():
+    from dataclasses import replace
+
+    async def scenario():
+        countries = ["Норвегия", "Непал", "Япония", "Норвегия", "Франция", "Италия"] * 3
+        for country in countries:
+            game.random_photo.return_value = replace(PHOTO, country=country)
+            await game.Geoguess.send_round_photo(message(1), game.Round("test"))
+        history = tuple(countries[-15:])
+        assert game.Geoguess.recent_countries[1] == history
+        game.random_photo.return_value = PHOTO
+        await game.Geoguess.send_round_photo(message(2), game.Round("other"))
+        assert game.random_photo.call_args.args == ((),)
+        assert game.Geoguess.recent_countries[1] == history
+        assert game.Geoguess.recent_countries[2] == ("Норвегия",)
+        await game.Geoguess.send_round_photo(message(1), game.Round("next"))
+        assert game.random_photo.call_args.args == (history,)
+        assert game.Geoguess.recent_countries[1] == (*history, "Норвегия")[-15:]
+
+    asyncio.run(scenario())
+
+
+def test_failed_delivery_keeps_country_history(monkeypatch):
+    monkeypatch.setattr(game, "PHOTO_TIMEOUT", 0.02)
+
+    async def scenario():
+        history = ("Непал", "Франция")
+        game.Geoguess.recent_countries[1] = history
+        m = message()
+
+        async def blocked(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        m.reply_photo.side_effect = blocked
+        await start(m)
+        assert game.random_photo.call_args.args == (history,)
+        assert game.Geoguess.recent_countries[1] == history
+        assert not game.Geoguess.rounds
+        assert m.reply.call_args.args[0] == "Ошибка, попробуйте еще раз"
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_discards_only_in_memory_country_history():
+    async def scenario():
+        game.Geoguess.recent_countries[1] = ("Непал", "Франция")
+        await game.Geoguess.shutdown()
+        assert not game.Geoguess.recent_countries
 
     asyncio.run(scenario())
