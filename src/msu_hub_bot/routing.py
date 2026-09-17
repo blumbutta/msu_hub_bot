@@ -41,6 +41,7 @@ from msu_hub_bot.commands.figlet import process_figlet
 from msu_hub_bot.commands.fun import matches_pokakats, process_beer, process_pokakats, process_puk
 from msu_hub_bot.commands.genders import process_gender
 from msu_hub_bot.commands.geoguess import Geoguess
+from msu_hub_bot.commands.chess import Chess
 from msu_hub_bot.commands.help import HelpMessage
 from msu_hub_bot.commands.infra import (
     process_create_infra_chat,
@@ -795,6 +796,26 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         StateFilter(None),
         F.content_type == ContentType.TEXT,
         flags={"handler_key": "process_gender", "fsm_release": True},
+    )
+    group("chess").message.register(
+        Chess.process,
+        MetaCommand("chess"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Chess.process", "fsm_release": True},
+    )
+    group("chess").message.register(
+        Chess.top,
+        MetaCommand("chess_top"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Chess.top", "fsm_release": True},
+    )
+    group("chess").callback_query.register(
+        Chess.process_cb,
+        Chess.callback_data.filter(),
+        StateFilter(None),
+        flags={"handler_key": "Chess.process_cb", "fsm_release": True},
     )
     group("geoguess").message.register(
         Geoguess.process,
