@@ -222,7 +222,7 @@ async def fetch_photo(recent_countries: tuple[str, ...] = ()) -> Photo:
                         return verified
                     if fallback is None or latest_occurrence[country] < latest_occurrence[fallback.country]:
                         fallback = verified
-    except (ExternalServiceError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
+    except ExternalServiceError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError:
         if fallback is None:
             raise
     if fallback is not None:
