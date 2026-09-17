@@ -9,6 +9,8 @@ from html import escape
 from typing import Optional, TypeVar, cast
 from collections.abc import Awaitable
 
+from cachetools import LRUCache
+
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.filters.callback_data import CallbackData
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -123,6 +125,7 @@ class GeoguessCallback(CallbackData, prefix="geoguess"):
 class Geoguess:
     callback_data = GeoguessCallback
     rounds: dict[int, Round] = {}
+    recent_countries: LRUCache[int, tuple[str, ...]] = LRUCache(maxsize=1024)
 
     @classmethod
     async def process(cls, message: Message, redis: RedisStorage, supervisor: Supervisor) -> Message | None:
@@ -153,7 +156,9 @@ class Geoguess:
 
     @classmethod
     async def send_round_photo(cls, message: Message, round_: Round) -> None:
-        photo = await random_photo()
+        chat_id = message.chat.id
+        recent = cls.recent_countries.get(chat_id, ())
+        photo = await random_photo(recent)
         options = random.sample(sorted(set(COUNTRIES.values()) - {photo.country}), 5) + [photo.country]
         random.shuffle(options)
         keyboard = InlineKeyboardBuilder()
@@ -174,6 +179,8 @@ class Geoguess:
                 reply_markup=keyboard.as_markup(),
             )
         )
+        # Remember only delivered questions; failed starts must not affect selection.
+        cls.recent_countries[chat_id] = (*recent, photo.country)[-15:]
 
     @classmethod
     def start_finish(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> asyncio.Task[None] | None:
@@ -378,3 +385,4 @@ class Geoguess:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         cls.rounds.clear()
+        cls.recent_countries.clear()
