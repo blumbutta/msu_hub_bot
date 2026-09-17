@@ -19,6 +19,7 @@ from msu_hub_bot.providers.exceptions import ExternalServiceError
 # Labels only, never a list of allowed photo locations. ISO countries and territories.
 COUNTRIES = {code.lower(): Locale("ru").territories[code] for code in pytz.country_names}
 GEOCODER_URL = os.environ.get("GEOGUESS_GEOCODER_URL", "https://nominatim.openstreetmap.org/reverse")
+FETCH_TIMEOUT = 8
 _geocoder_lock = None
 _geocoder_next = 0.0
 _geocoder_cache = TTLCache(maxsize=1024, ttl=86400)
@@ -178,7 +179,7 @@ async def reverse_location(session, latitude, longitude):
         return result
 
 
-async def fetch_photo():
+async def fetch_photo(recent_countries: tuple[str, ...] = ()) -> Photo:
     # Sample the entire Commons file namespace, then keep usable geotagged photos.
     # No city list, country filter, geographic radius or search-result ranking.
     params = {
@@ -194,28 +195,45 @@ async def fetch_photo():
         "maxage": 0,
         "smaxage": 0,
     }
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=8),
-        headers={"User-Agent": "MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)"},
-    ) as session:
-        data = await request_json(session, "https://commons.wikimedia.org/w/api.php", params)
-        photos = candidates(data)
-        if not photos:
-            raise ExternalServiceError("Подходящего фото не нашлось.")
-        random.shuffle(photos)
-        for candidate in photos[:4]:
-            try:
-                country, city = await reverse_location(session, candidate.latitude, candidate.longitude)
-            except UnknownLocation:
-                continue
-            photo = candidate.photo
-            return Photo(country, city, photo.url, photo.source, photo.author, photo.license, photo.license_url)
-        raise ExternalServiceError("Нет фото с определённой страной.")
-
-
-async def random_photo() -> Photo:
+    # History is oldest first; a repeated country's latest occurrence determines its priority.
+    latest_occurrence = {country: index for index, country in enumerate(recent_countries)}
+    fallback: Photo | None = None
     try:
-        # Includes geocoder queue time; caller also limits photo delivery to 10 s.
-        return await asyncio.wait_for(fetch_photo(), timeout=8)
+        # Includes the shared geocoder queue and session cleanup. Keep a verified fallback
+        # when looking for a new country exhausts the budget, leaving time for Telegram.
+        async with asyncio.timeout(FETCH_TIMEOUT):
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+                headers={"User-Agent": "MSUHubBot-Geoguess/1.0 (https://github.com/uburuntu/msu_hub_bot)"},
+            ) as session:
+                data = await request_json(session, "https://commons.wikimedia.org/w/api.php", params)
+                photos = candidates(data)
+                if not photos:
+                    raise ExternalServiceError("Подходящего фото не нашлось.")
+                random.shuffle(photos)
+                for candidate in photos[:4]:
+                    try:
+                        country, city = await reverse_location(session, candidate.latitude, candidate.longitude)
+                    except UnknownLocation:
+                        continue
+                    photo = candidate.photo
+                    verified = Photo(country, city, photo.url, photo.source, photo.author, photo.license, photo.license_url)
+                    if country not in latest_occurrence:
+                        return verified
+                    if fallback is None or latest_occurrence[country] < latest_occurrence[fallback.country]:
+                        fallback = verified
+    except (ExternalServiceError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
+        if fallback is None:
+            raise
+    if fallback is not None:
+        return fallback
+    raise ExternalServiceError("Нет фото с определённой страной.")
+
+
+async def random_photo(recent_countries: tuple[str, ...] = ()) -> Photo:
+    try:
+        # fetch_photo owns its deadline so it can return a verified fallback on timeout.
+        # The command additionally limits fetching plus Telegram delivery to 10 seconds.
+        return await fetch_photo(recent_countries)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError) as exc:
         raise ExternalServiceError("Не удалось получить фото. Попробуй позже.") from exc
