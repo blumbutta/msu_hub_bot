@@ -10,8 +10,10 @@ import pytest
 from aiogram import BaseMiddleware, Dispatcher
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Update
+from aiogram.types import CallbackQuery, Update, User
 
+from msu_hub_bot.commands.chess import ChessCallback
+from msu_hub_bot.commands.geoguess import GeoguessCallback
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
 from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
 from msu_hub_bot.telegram.state import (
@@ -57,7 +59,11 @@ def aliases(handler):
 
 
 def is_added_route(handler):
-    return aliases(handler) == ["py_stdin", "python_stdin"]
+    return aliases(handler) == ["py_stdin", "python_stdin"] or handler.flags["handler_key"] in {
+        "Chess.process",
+        "Chess.top",
+        "Chess.process_cb",
+    }
 
 
 def test_every_route_preserves_order_and_aliases():
@@ -65,7 +71,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = 1 if kind in ("message", "edited_message") else 0
+        extra = {"message": 3, "edited_message": 1, "callback_query": 1}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
@@ -116,6 +122,81 @@ async def test_captured_selection_through_real_dispatch(case):
     finally:
         await fsm.close()
         await bot.session.close()
+
+
+@pytest.fixture
+async def chess_selection_dispatcher():
+    bot = make_bot()
+    bot._me = User(id=bot.id, is_bot=True, first_name="Synthetic", username="contract_bot")
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.update.outer_middleware(StateContextMiddleware())
+    fsm = TopicFSMContextMiddleware(MemoryStorage(), ReleasableEventIsolation())
+    dispatcher.update.outer_middleware(fsm)
+    for observer in (dispatcher.message, dispatcher.callback_query):
+        observer.middleware(SelectiveIsolationMiddleware())
+        observer.middleware(Selection())
+    dispatcher.include_router(router())
+    try:
+        yield bot, dispatcher
+    finally:
+        await fsm.close()
+        await bot.session.close()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/chess", "Chess.process"),
+        ("/chess@contract_bot", "Chess.process"),
+        ("/CHESS", "Chess.process"),
+        ("/CHESS@CONTRACT_BOT", "Chess.process"),
+        ("/chess_top", "Chess.top"),
+        ("/chess_top@contract_bot", "Chess.top"),
+        ("/CHESS_TOP", "Chess.top"),
+        ("/CHESS_TOP@CONTRACT_BOT", "Chess.top"),
+        ("/chess@another_bot", None),
+        ("/chess_top@another_bot", None),
+    ],
+)
+async def test_chess_commands_select_real_routes_with_case_and_mentions(chess_selection_dispatcher, text, expected):
+    bot, dispatcher = chess_selection_dispatcher
+    update = Update(update_id=1, message=make_message(bot, text=text))
+    result = await asyncio.create_task(dispatcher.feed_update(bot, update))
+    if expected is None:
+        assert result is UNHANDLED
+    else:
+        handler, meta = result
+        assert handler.callback.__qualname__ == expected
+        assert handler.flags["handler_key"] == expected
+        assert meta is not None
+    assert bot.session.methods == []
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (ChessCallback(round="round-token", choice="0").pack(), "Chess.process_cb"),
+        (ChessCallback(round="round-token", choice="finish").pack(), "Chess.process_cb"),
+        (GeoguessCallback(round="round-token", choice="0").pack(), "Geoguess.process_cb"),
+        (GeoguessCallback(round="round-token", choice="finish").pack(), "Geoguess.process_cb"),
+        ("chessboard:round-token:0", "process_expired_callback"),
+        ("chess:round-token", "process_expired_callback"),
+    ],
+)
+async def test_chess_and_geoguess_callbacks_select_separate_real_routes(chess_selection_dispatcher, data, expected):
+    bot, dispatcher = chess_selection_dispatcher
+    callback = CallbackQuery(
+        id="synthetic",
+        chat_instance="synthetic",
+        from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+        message=make_message(bot),
+        data=data,
+    )
+    result = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback)))
+    handler, _ = result
+    assert handler.callback.__qualname__ == expected
+    assert handler.flags["handler_key"] == expected
+    assert bot.session.methods == []
 
 
 @pytest.mark.parametrize("command", ["start", "cancel", "beer", "arxiv", "stt"])
