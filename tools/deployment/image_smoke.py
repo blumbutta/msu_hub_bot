@@ -153,6 +153,24 @@ def check_youtube_runtime():
             provider.close()
 
 
+def check_chess():
+    import chess
+    from PIL import Image
+
+    from msu_hub_bot.media.chessboard import render_board
+
+    board = chess.Board()
+    for move in ("e2e4", "e7e5"):
+        question = render_board(board.fen())
+        solution = render_board(board.fen(), arrow=move)
+        assert question != solution, "Chess solution arrow is missing"
+        for payload in (question, solution):
+            with Image.open(io.BytesIO(payload)) as image:
+                assert image.format == "PNG" and image.size == (720, 720)
+                image.verify()
+        board.push_uci(move)
+
+
 async def main():
     socket.socket.connect = blocked
     socket.socket.connect_ex = blocked
@@ -166,6 +184,7 @@ async def main():
     check_media(audio)
     check_animation()
     check_youtube_runtime()
+    check_chess()
     from msu_hub_bot.app import Application
     from msu_hub_bot.settings import settings
 
@@ -182,8 +201,8 @@ async def main():
         def count(event):
             return sum(len(router.observers[event].handlers) for router in app.dispatcher.chain_tail)
 
-        assert count("message") == 262
-        assert count("callback_query") == 19
+        assert count("message") == 264
+        assert count("callback_query") == 20
         assert count("edited_message") == 149
         from PIL import ImageFont
 
@@ -203,7 +222,7 @@ async def main():
         assert await asyncio.to_thread(sed_calc, "Привет, кот!", ["s/кот/бот/"]) == "Привет, бот!"
     finally:
         await app.close()
-    print("Linux image: fingerprint, OCR, camera, Opus/VP9/WebP/TGS, Deno/EJS, resources, worker, handlers, and shutdown passed")
+    print("Linux image: fingerprint, OCR, camera, Opus/VP9/WebP/TGS, chess PNG, Deno/EJS, resources, worker, handlers, and shutdown passed")
 
 
 if __name__ == "__main__":
