@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from aiogram.types import Message
+from aiogram.utils.formatting import Text
 from msu_hub_bot.telegram.runtime import Supervisor
 
 import pytest
@@ -65,6 +66,8 @@ def query(round_, choice, user_id=5):
 def isolated(monkeypatch):
     game.Geoguess.rounds = {}
     monkeypatch.setattr(game.Geoguess, "recent_countries", game.LRUCache(maxsize=1024))
+    monkeypatch.setattr(game.Geoguess, "completed", game.TTLCache(maxsize=128, ttl=game.RESULT_TTL))
+    monkeypatch.setattr(game, "EDIT_INTERVAL", 0)
     monkeypatch.setattr(game, "today", lambda: date(2026, 9, 17))
 
     async def send(method):
@@ -84,7 +87,11 @@ def test_photo_has_six_flagged_choices_timer_and_duplicate_guard():
         r = game.Geoguess.rounds[1]
         args = m.reply_photo.call_args
         assert args.args == (PHOTO.url,)
-        assert "caption" not in args.kwargs
+        assert "Угадай страну" in args.kwargs["caption"]
+        assert PHOTO.country not in args.kwargs["caption"] and PHOTO.city not in args.kwargs["caption"]
+        assert args.kwargs["parse_mode"] is None and args.kwargs["caption_entities"]
+        assert len(Text(args.kwargs["caption"])) <= 1024
+        m.reply.assert_not_awaited()
         buttons = [b for row in args.kwargs["reply_markup"].inline_keyboard for b in row]
         assert len(buttons) == 7
         assert len(set(r.options)) == 6 and PHOTO.country in r.options
@@ -131,10 +138,15 @@ def test_active_votes_hide_choices_but_show_count_names_and_usernames():
         r = game.Geoguess.rounds[1]
         await process_callback(*query(r, 0))
         assert r.votes == {5: (0, "User <5>")}
-        text = r.board.edit_text.call_args.args[0]
-        assert "User &lt;5&gt;" in text and "@user_5" in text
-        assert "1" in text
+        args = r.message.edit_caption.call_args.kwargs
+        text = args["caption"]
+        assert "User <5>" in text and "@user_5" in text
+        assert "Ответили: 1" in text
+        assert args["parse_mode"] is None
+        mention = next(entity for entity in args["caption_entities"] if entity.url == "tg://user?id=5")
+        assert mention.extract_from(text) == "User <5>"
         assert all(country not in text for country in r.options)
+        r.message.reply.assert_not_awaited()
         q, data = query(r, 1)
         await process_callback(q, data)
         assert r.votes[5][0] == 0
@@ -157,13 +169,14 @@ def test_anyone_can_finish_once_and_scores_all_votes():
         game.save_scores.assert_awaited_once_with(
             1, [(10, "User <10>", "user_10", 1), (11, "User <11>", "user_11", -1)], None, date(2026, 9, 17), round_token=r.token
         )
-        final_board = "\n".join(r.board_texts)
-        assert all(game.country_label(country) in final_board for country in r.options)
-        assert "User &lt;10&gt;" in final_board and "@user_10" in final_board
-        assert "User &lt;11&gt;" in final_board and "@user_11" in final_board
+        final_board = r.message.edit_caption.call_args.kwargs["caption"]
+        assert all(game.country_label(r.options[choice]) in final_board for choice, _ in r.votes.values())
+        assert "User <10>" in final_board and "@user_10" in final_board
+        assert "User <11>" in final_board and "@user_11" in final_board
+        assert "✓" in final_board and "✗" in final_board
         assert r.timer.cancelled()
         text = r.message.edit_caption.call_args.kwargs["caption"]
-        assert "Берген" in text and "Норвегия" in text and "+1 очко" in text
+        assert "Берген" in text and "Норвегия" in text and "+1" in text and "−1" in text
         assert r.message.edit_caption.call_args.kwargs["reply_markup"] is None
         assert "Источник фотографии" in text
         await process_callback(*query(r, answer, 12))
@@ -338,7 +351,10 @@ def test_daily_score_storage_and_top(monkeypatch):
         m = message()
         await module.Geoguess.top(m, redis)
         text = m.reply.call_args.args[0]
-        assert "Alice &lt;name&gt;" in text and "@alice" in text and "— 3" in text
+        assert "Alice <name>" in text and "@alice" in text and "— 3" in text
+        assert m.reply.call_args.kwargs["parse_mode"] is None
+        mention = next(entity for entity in m.reply.call_args.kwargs["entities"] if entity.url == "tg://user?id=10")
+        assert mention.extract_from(text) == "Alice <name>"
         assert "17.09.2026" in text
         client.zrevrange.assert_awaited_once_with(module.score_key(1, day), 0, 9, withscores=True)
         assert module.score_key(1, day) != module.score_key(1, date(2026, 9, 16))
@@ -353,10 +369,19 @@ def test_all_voters_visible_with_large_group():
         r = game.Geoguess.rounds[1]
         r.votes = {i: (i % 6, f"Participant {i:04d} " + "X" * 20) for i in range(150)}
         await game.Geoguess.update_board(r)
-        assert len(r.board_texts) > 1
-        rendered = "\n".join(r.board_texts)
+        assert r.view.pages > 1
+        captions = []
+        for page in range(r.view.pages):
+            await process_callback(*query(r, f"page_{page}"))
+            captions.append(r.view.caption)
+            assert r.view.page == page
+        rendered = "\n".join(captions)
         assert all(f"Participant {i:04d}" in rendered for i in range(150))
-        assert all(len(text) <= 3000 for text in r.board_texts)
+        assert all(len(Text(text)) <= 1024 for text in captions)
+        assert all(country not in rendered for country in r.options)
+        assert len(r.votes) == 150
+        game.save_scores.assert_not_awaited()
+        r.message.reply.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -384,9 +409,12 @@ def test_winners_use_usernames_and_clickable_fallback():
         q.from_user.username = None
         await process_callback(q, data)
         await process_callback(*query(r, "finish"))
-        text = r.message.edit_caption.call_args.kwargs["caption"]
-        assert "@user_10" in text and "User &lt;10&gt;" in text
-        assert '<a href="tg://user?id=11">User &lt;11&gt;</a>' in text
+        args = r.message.edit_caption.call_args.kwargs
+        text = args["caption"]
+        assert "@user_10" in text and "User <10>" in text
+        mention = next(entity for entity in args["caption_entities"] if entity.url == "tg://user?id=11")
+        assert mention.extract_from(text) == "User <11>"
+        assert args["parse_mode"] is None
 
     asyncio.run(scenario())
 
@@ -399,9 +427,16 @@ def test_long_winner_list_mentions_everyone():
         r.votes = {i: (answer, f"User {i}") for i in range(100)}
         r.usernames = {i: f"participant_{i:04d}" for i in range(100)}
         await process_callback(*query(r, "finish"))
-        text = r.message.edit_caption.call_args.kwargs["caption"]
-        text += "\n".join(call.args[0] for call in r.message.reply.call_args_list)
+        captions = []
+        for page in range(r.view.pages):
+            await process_callback(*query(r, f"page_{page}"))
+            captions.append(r.view.caption)
+        text = "\n".join(captions)
         assert all("@participant_" + f"{i:04d}" in text for i in range(100))
+        assert all(len(Text(caption)) <= 1024 for caption in captions)
+        assert all("Угадали 100 из 100" in caption for caption in captions)
+        r.message.reply.assert_not_awaited()
+        game.save_scores.assert_awaited_once()
 
     asyncio.run(scenario())
 
@@ -565,7 +600,7 @@ def test_country_only_caption_has_no_empty_city():
         r = game.Geoguess.rounds[1]
         await process_callback(*query(r, "finish"))
         text = r.message.edit_caption.call_args.kwargs["caption"]
-        assert "Норвегия</b>" in text
+        assert "На снимке — 🇳🇴 Норвегия." in text
         assert "OpenStreetMap" in text
 
     asyncio.run(scenario())
@@ -574,9 +609,9 @@ def test_country_only_caption_has_no_empty_city():
 def test_country_and_user_labels_escape_untrusted_text():
     assert game.country_label("Норвегия") == "🇳🇴 Норвегия"
     assert game.country_label("Unlisted <place>") == "Unlisted <place>"
-    label = game.user_label(42, "User <name>", "user_name")
+    label = game.user_label(42, "User <name>", "user_name").as_html()
     assert "User &lt;name&gt;" in label and "@user_name" in label
-    assert game.user_label(42, "User <name>", None) == '<a href="tg://user?id=42">User &lt;name&gt;</a>'
+    assert game.user_label(42, "User <name>", None).as_html() == '<a href="tg://user?id=42">User &lt;name&gt;</a>'
 
 
 def test_today_uses_moscow_midnight(monkeypatch):

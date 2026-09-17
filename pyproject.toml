@@ -131,6 +131,7 @@ files = [
     "src/msu_hub_bot/commands/fun.py",
     "src/msu_hub_bot/commands/genders.py",
     "src/msu_hub_bot/commands/geoguess.py",
+    "src/msu_hub_bot/commands/geoguess_view.py",
     "src/msu_hub_bot/commands/help.py",
     "src/msu_hub_bot/commands/infra.py",
     "src/msu_hub_bot/commands/latex.py",

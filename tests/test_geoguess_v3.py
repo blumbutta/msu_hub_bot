@@ -61,6 +61,8 @@ class GameSession(RecordingSession):
 async def rig(monkeypatch):
     monkeypatch.setattr(game.Geoguess, "rounds", {})
     monkeypatch.setattr(game.Geoguess, "recent_countries", game.LRUCache(maxsize=1024))
+    monkeypatch.setattr(game.Geoguess, "completed", game.TTLCache(maxsize=128, ttl=game.RESULT_TTL))
+    monkeypatch.setattr(game, "EDIT_INTERVAL", 0)
     monkeypatch.setattr(game, "random_photo", AsyncMock(return_value=PHOTO))
     session = GameSession()
     bot = BotWrapper("123456789:" + "a" * 35, session=session)
@@ -100,6 +102,12 @@ async def start(rig):
     return game.Geoguess.rounds[rig.message.chat.id]
 
 
+def reveals(rig):
+    return [
+        method for method in rig.session.methods if isinstance(method, EditMessageCaption) and method.caption.startswith("🌍 На снимке")
+    ]
+
+
 async def test_round_uses_real_shortcuts_and_scores_once(rig):
     round_ = await start(rig)
     await game.Geoguess.process(rig.message, rig.redis, rig.supervisor)
@@ -120,35 +128,55 @@ async def test_round_uses_real_shortcuts_and_scores_once(rig):
     assert len(photos) == 1 and photos[0].photo == PHOTO.url
     assert photos[0].reply_parameters.message_id == rig.message.message_id
     assert len([button for row in photos[0].reply_markup.inline_keyboard for button in row]) == 7
-    assert {type(method) for method in methods} == {SendPhoto, SendMessage, EditMessageText, AnswerCallbackQuery, EditMessageCaption}
+    assert {type(method) for method in methods} == {SendPhoto, SendMessage, AnswerCallbackQuery, EditMessageCaption}
     assert all(method.message_thread_id == 17 for method in methods if isinstance(method, (SendMessage, SendPhoto)))
-    boards = [method for method in methods if isinstance(method, SendMessage) and "Проголосовали" in method.text]
-    assert boards[0].reply_parameters.message_id == round_.message.message_id
-    reveals = [method for method in methods if isinstance(method, EditMessageCaption)]
-    assert len(reveals) == 1 and reveals[0].message_id == round_.message.message_id
-    assert "Берген" in reveals[0].caption and "Норвегия" in reveals[0].caption and "User &lt;name&gt;" in reveals[0].caption
-    assert reveals[0].reply_markup is None
+    replies = [method for method in methods if isinstance(method, SendMessage)]
+    assert len(replies) == 1 and "прошлое задание" in replies[0].text
+    edits = [method for method in methods if isinstance(method, EditMessageCaption)]
+    assert len(edits) == 2 and all(method.message_id == round_.message.message_id for method in edits)
+    assert "Ответили: 1" in edits[0].caption and all(country not in edits[0].caption for country in round_.options)
+    results = reveals(rig)
+    assert len(results) == 1
+    result = results[0]
+    assert "Берген" in result.caption and "Норвегия" in result.caption and "User <name>" in result.caption
+    mention = next(entity for entity in result.caption_entities if entity.url == "tg://user?id=42")
+    assert mention.extract_from(result.caption) == "User <name>"
+    assert result.parse_mode is None and result.reply_markup is None
     assert all(timeout == game.SEND_TIMEOUT for timeout in rig.session.timeouts)
     assert all("request_timeout" not in method.model_extra for method in methods)
 
 
-async def test_failed_caption_edit_replies_in_the_same_topic(rig):
+async def test_failed_caption_edit_preserves_one_message_and_can_retry(rig):
     round_ = await start(rig)
+    initial_view = round_.view
     rig.session.caption_error = True
     await click(rig, round_, "finish")
     result = rig.session.methods[-1]
-    assert isinstance(result, SendMessage) and "Берген" in result.text and "Норвегия" in result.text
-    assert result.reply_parameters.message_id == round_.message.message_id and result.message_thread_id == 17
-    assert result.parse_mode == "HTML" and result.disable_web_page_preview is True
+    assert isinstance(result, EditMessageCaption) and "Берген" in result.caption and "Норвегия" in result.caption
+    assert result.message_id == round_.message.message_id and result.chat_id == round_.message.chat.id
+    assert result.parse_mode is None and result.caption_entities
+    assert round_.view == initial_view
+    assert not any(isinstance(method, SendMessage) for method in rig.session.methods)
     assert not game.Geoguess.rounds
+    assert game.Geoguess.completed[round_.message.chat.id, round_.token] is round_
+    rig.session.caption_error = False
+    await click(rig, round_, "page_0")
+    assert isinstance(rig.session.methods[-1], EditMessageCaption)
+    assert rig.session.methods[-1].message_id == round_.message.message_id
+    assert round_.view.caption == result.caption and round_.view != initial_view
+    assert not any(isinstance(method, SendMessage) for method in rig.session.methods)
 
 
 async def test_leaderboard_uses_real_shortcuts_when_storage_fails(rig):
     rig.client.zrevrange.return_value = [(b"42", 3)]
     rig.client.hget.side_effect = [b"User <name>", b"user_name"]
     await game.Geoguess.top(rig.message, rig.redis)
-    assert "User &lt;name&gt;" in rig.session.methods[-1].text
-    assert "@user_name" in rig.session.methods[-1].text and "— 3" in rig.session.methods[-1].text
+    result = rig.session.methods[-1]
+    assert "User <name>" in result.text
+    assert "@user_name" in result.text and "— 3" in result.text
+    assert result.parse_mode is None
+    mention = next(entity for entity in result.entities if entity.url == "tg://user?id=42")
+    assert mention.extract_from(result.text) == "User <name>"
     rig.client.zrevrange.side_effect = RuntimeError("synthetic storage failure")
     await game.Geoguess.top(rig.message, rig.redis)
     result = rig.session.methods[-1]
@@ -186,7 +214,7 @@ async def test_cancelled_callback_does_not_cancel_started_finish(rig):
         assert drained.cancelled_jobs == drained.failed_jobs == 0
         await click(rig, round_, "finish")
         rig.client.eval.assert_awaited_once()
-        assert len([method for method in rig.session.methods if isinstance(method, EditMessageCaption)]) == 1
+        assert len(reveals(rig)) == 1
         assert not game.Geoguess.rounds and rig.supervisor.job_count == 0
     finally:
         release.set()
@@ -227,7 +255,7 @@ async def test_timer_expires_after_photo_and_reveals_once(rig, monkeypatch):
     assert round_.closed and round_.timer.cancelled()
     rig.client.eval.assert_awaited_once()
     assert not game.Geoguess.rounds
-    assert len([method for method in rig.session.methods if isinstance(method, EditMessageCaption)]) == 1
+    assert len(reveals(rig)) == 1
 
 
 async def test_manual_finish_and_due_timer_share_one_completion(rig, monkeypatch):
@@ -251,7 +279,7 @@ async def test_manual_finish_and_due_timer_share_one_completion(rig, monkeypatch
         await manual
         await rig.supervisor.drain(timeout=1, cancel_timeout=0.5)
         rig.client.eval.assert_awaited_once()
-        assert len([method for method in rig.session.methods if isinstance(method, EditMessageCaption)]) == 1
+        assert len(reveals(rig)) == 1
         assert not game.Geoguess.rounds
     finally:
         release.set()
@@ -353,7 +381,7 @@ async def test_timer_first_rejects_finish_click_while_scoring(rig, monkeypatch):
         assert rig.client.eval.await_count == 1
         release.set()
         await rig.supervisor.drain(timeout=1, cancel_timeout=0.5)
-        assert len([method for method in rig.session.methods if isinstance(method, EditMessageCaption)]) == 1
+        assert len(reveals(rig)) == 1
         assert not game.Geoguess.rounds
     finally:
         release.set()
