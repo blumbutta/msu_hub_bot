@@ -60,6 +60,7 @@ class GameSession(RecordingSession):
 @pytest.fixture
 async def rig(monkeypatch):
     monkeypatch.setattr(game.Geoguess, "rounds", {})
+    monkeypatch.setattr(game.Geoguess, "recent_countries", game.LRUCache(maxsize=1024))
     monkeypatch.setattr(game, "random_photo", AsyncMock(return_value=PHOTO))
     session = GameSession()
     bot = BotWrapper("123456789:" + "a" * 35, session=session)
@@ -273,7 +274,7 @@ async def test_loading_does_not_consume_round_deadline(rig, monkeypatch):
     monkeypatch.setattr(game, "ROUND_TIMEOUT", 0.05)
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def photo():
+    async def photo(recent_countries):
         entered.set()
         await release.wait()
         return PHOTO
