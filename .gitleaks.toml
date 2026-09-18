@@ -23,3 +23,10 @@ id = "generic-api-key"
     paths = ['''(?:^|/)tests/fixtures/api2ch_source\.json$''']
     regexTarget = "secret"
     regexes = ['''^c39b0cfe0d611420cad06c6ff3650864075e56fe74a52a837c5248985d66cb11$''']
+
+    [[rules.allowlists]]
+    description = "Synthetic chess game identifier used only in board and view tests, never an authentication token"
+    condition = "AND"
+    paths = ['''(?:^|/)tests/test_chess_play_(?:board|view)\.py$''']
+    regexTarget = "secret"
+    regexes = ['''^012345abcdef$''']
