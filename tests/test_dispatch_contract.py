@@ -17,6 +17,7 @@ from msu_hub_bot.commands.geoguess import GeoguessCallback
 from msu_hub_bot.commands.reactions import ReactionCallback
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
 from msu_hub_bot.telegram.middlewares.settings import SettingsMiddleware
+from msu_hub_bot.telegram.runtime import AdmissionMiddleware
 from msu_hub_bot.telegram.state import (
     ReleasableEventIsolation,
     SelectiveIsolationMiddleware,
@@ -30,6 +31,11 @@ from msu_hub_bot.settings import Settings
 from msu_hub_bot.telemetry import Telemetry
 from telegram_helpers import RecordingSession, make_bot, make_message
 from telemetry_helpers import Capture, config
+import test_chess
+import test_geoguess_v3
+
+chess_rig = test_chess.rig
+geoguess_rig = test_geoguess_v3.rig
 
 CONTRACT = json.loads((Path(__file__).parent / "fixtures/routing_contract.json").read_text())
 
@@ -331,6 +337,58 @@ async def test_chess_and_geoguess_callbacks_select_separate_real_routes(chess_se
     assert handler.callback.__qualname__ == expected
     assert handler.flags["handler_key"] == expected
     assert bot.session.methods == []
+
+
+@pytest.mark.parametrize("quiz", ["chess", "geoguess"])
+@pytest.mark.parametrize("conversation", ["ProgStates:stdin", "StickerStates:sticker_set_name"])
+async def test_quiz_votes_pages_and_finish_preserve_another_active_conversation(chess_rig, geoguess_rig, quiz, conversation):
+    rig, begin, callback_type = (
+        (chess_rig, test_chess.start, ChessCallback) if quiz == "chess" else (geoguess_rig, test_geoguess_v3.start, GeoguessCallback)
+    )
+    round_ = await begin(rig)
+    round_.votes.update({uid: (uid % 6, f"Player {uid}") for uid in range(100, 106)})
+    dispatcher = Dispatcher(disable_fsm=True, redis=rig.redis, supervisor=rig.supervisor)
+    dispatcher.update.outer_middleware(AdmissionMiddleware(rig.supervisor))
+    dispatcher.update.outer_middleware(StateContextMiddleware())
+    isolation = ReleasableEventIsolation()
+    fsm = TopicFSMContextMiddleware(MemoryStorage(), isolation)
+    dispatcher.update.outer_middleware(fsm)
+    dispatcher.callback_query.middleware(SelectiveIsolationMiddleware())
+    dispatcher.include_router(router())
+    context = fsm.resolve_context(rig.bot, rig.message.chat.id, 42, thread_id=17)
+    other_topic = fsm.resolve_context(rig.bot, rig.message.chat.id, 42, thread_id=18)
+    saved_data = {"source": "print(input())", "stdin_lines": ["first", "second"]}
+    await context.set_state(conversation)
+    await context.set_data(saved_data)
+    await other_topic.set_state("Other:waiting")
+    await other_topic.set_data({"untouched": True})
+    try:
+        for update_id, choice in enumerate(("0", "page_1", "finish"), start=1):
+            callback = CallbackQuery(
+                id=f"synthetic-{update_id}",
+                chat_instance="synthetic",
+                from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+                message=round_.message,
+                data=callback_type(round=round_.token, choice=choice).pack(),
+            )
+            await asyncio.create_task(dispatcher.feed_update(rig.bot, Update(update_id=update_id, callback_query=callback)))
+            assert await context.get_state() == conversation
+            assert await context.get_data() == saved_data
+            assert await other_topic.get_state() == "Other:waiting"
+            assert await other_topic.get_data() == {"untouched": True}
+            assert isolation.key_count == 0
+            if choice == "0":
+                assert round_.votes[42] == (0, "Synthetic")
+            elif choice == "page_1":
+                assert round_.view.page == 1
+            else:
+                assert round_.closed and round_.scored is True
+                assert round_.view.page == 0
+                rig.client.eval.assert_awaited_once()
+        assert all("больше не работает" not in (getattr(method, "text", None) or "") for method in rig.bot.session.methods)
+    finally:
+        await fsm.close()
+        await dispatcher.fsm.close()
 
 
 @pytest.mark.parametrize("command", ["start", "cancel", "beer", "arxiv", "stt"])
