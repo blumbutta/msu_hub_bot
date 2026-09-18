@@ -79,7 +79,7 @@ jobs:
           HUB_TEST_POSTGRES_DSN: postgresql://postgres:test-only-postgres@localhost:5432/hub_test_ci
 
       - name: Exercise quiz scoring and replay protection
-        run: uv run --no-sync pytest -q tests/test_quiz_redis.py
+        run: uv run --no-sync pytest -q tests/test_quiz_redis.py tests/test_quiz_store.py
         env:
           HUB_TEST_REDIS_URL: redis://127.0.0.1:6379/0
 
