@@ -76,6 +76,9 @@ def isolated(monkeypatch):
     monkeypatch.setattr(game, "_send", send)
     monkeypatch.setattr(game, "random_photo", AsyncMock(return_value=PHOTO))
     monkeypatch.setattr(game, "save_scores", AsyncMock())
+    monkeypatch.setattr(game.Geoguess, "persist", AsyncMock())
+    monkeypatch.setattr(game.Geoguess, "save_state", AsyncMock())
+    monkeypatch.setattr(game.quiz_store, "load", AsyncMock(return_value=None))
     yield
     game.Geoguess.rounds = {}
 
