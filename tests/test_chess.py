@@ -109,7 +109,7 @@ class ScoreStore:
 
 
 @pytest.fixture
-async def rig(monkeypatch):
+async def rig(monkeypatch, saved_quizzes):
     monkeypatch.setattr(game.Chess, "rounds", {})
     monkeypatch.setattr(game.Chess, "recent_puzzles", game.LRUCache(maxsize=1024))
     monkeypatch.setattr(game.Chess, "completed", game.TTLCache(maxsize=game.MAX_ROUNDS, ttl=game.RESULT_TTL))
@@ -128,6 +128,7 @@ async def rig(monkeypatch):
         client=client,
         redis=SimpleNamespace(redis=AsyncMock(return_value=client)),
         supervisor=supervisor,
+        snapshots=saved_quizzes,
     )
     await game.Chess.shutdown()
     await supervisor.drain(timeout=1, cancel_timeout=0.5)
@@ -672,8 +673,12 @@ async def test_completed_navigation_does_not_interfere_with_new_game_or_repeat_s
     game.Chess.completed.clear()
     before = len(captions(rig))
     await click(rig, old, "page_0")
-    assert len(captions(rig)) == before
-    assert "недоступен" in rig.session.methods[-1].text
+    assert len(captions(rig)) == before + 1
+    restored = game.Chess.completed[rig.message.chat.id, old.token]
+    assert restored is not old and restored.closed and restored.scored
+    assert restored.message.message_id == old.message.message_id
+    assert game.Chess.rounds[rig.message.chat.id] is current
+    rig.client.eval.assert_awaited_once()
     assert game.Chess.completed.maxsize == 128 and game.Chess.completed.ttl == 86400
 
 
@@ -691,3 +696,323 @@ async def test_send_deadline_includes_blocked_telegram_middleware(rig, monkeypat
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(game._send(rig.message.reply("synthetic")), timeout=0.5)
     assert cancelled.is_set() and not rig.session.methods
+
+
+def snapshot(rig, round_):
+    key = ("chess", rig.bot.id, rig.message.chat.id, round_.token)
+    return game.quiz_store.SavedRound.model_validate_json(rig.snapshots.states[key])
+
+
+async def settle(round_):
+    if round_.task is not None:
+        await asyncio.wait_for(asyncio.shield(round_.task), timeout=1)
+
+
+async def test_delivered_round_and_acknowledged_vote_are_saved_with_original_message(rig):
+    before = game.wall_time()
+    round_ = await start(rig)
+    initial = snapshot(rig, round_)
+    assert before + 600 <= initial.deadline <= game.wall_time() + 600
+    assert initial.message.message_id == round_.message.message_id and initial.message.message_thread_id == 17
+    assert game.PUZZLE_ADAPTER.validate_json(initial.question) == PUZZLE
+    await click(rig, round_, correct(round_))
+    accepted = snapshot(rig, round_)
+    assert accepted.votes == round_.votes and accepted.usernames == {42: "user_name"}
+    assert not accepted.closed and not accepted.revealed
+
+
+async def test_initial_save_failure_keeps_delivered_card_and_deadline(rig):
+    rig.snapshots.save.side_effect = RuntimeError("Unavailable snapshots")
+    round_ = await start(rig)
+    assert round_.message is not None and round_.deadline > game.wall_time()
+    assert round_.timer is not None and not round_.timer.cancelled()
+    assert not any(isinstance(method, SendMessage) for method in rig.session.methods)
+    rig.snapshots.save.side_effect = rig.snapshots.put
+    await click(rig, round_, correct(round_))
+    assert snapshot(rig, round_).votes == round_.votes
+
+
+async def test_lost_vote_save_reply_preserves_choice_and_repeated_click_confirms_it(rig):
+    round_ = await start(rig)
+    answer = correct(round_)
+
+    async def commit_then_fail(*args):
+        await rig.snapshots.put(*args)
+        raise TimeoutError("Reply lost after commit")
+
+    rig.snapshots.save.side_effect = commit_then_fail
+    await click(rig, round_, answer)
+    assert round_.votes[42][0] == answer and snapshot(rig, round_).votes[42][0] == answer
+    assert "Не удалось подтвердить" in rig.session.methods[-1].text
+    rig.snapshots.save.side_effect = rig.snapshots.put
+    await click(rig, round_, (answer + 1) % 6)
+    assert "уже принят" in rig.session.methods[-1].text
+    assert round_.votes[42][0] == snapshot(rig, round_).votes[42][0] == answer
+    await click(rig, round_, "finish")
+    assert rig.client.scores[game.score_key(rig.message.chat.id, round_.score_day)] == {"42": 1}
+
+
+async def test_cancelled_vote_after_commit_does_not_erase_the_durable_choice(rig):
+    round_ = await start(rig)
+    committed = asyncio.Event()
+
+    async def commit_and_block(*args):
+        await rig.snapshots.put(*args)
+        committed.set()
+        await asyncio.Event().wait()
+
+    rig.snapshots.save.side_effect = commit_and_block
+    worker = asyncio.create_task(click(rig, round_, correct(round_)))
+    await committed.wait()
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    assert round_.votes == snapshot(rig, round_).votes
+    rig.snapshots.save.side_effect = rig.snapshots.put
+    await click(rig, round_, correct(round_))
+    assert "уже принят" in rig.session.methods[-1].text
+
+
+async def test_restart_restores_remaining_time_votes_and_same_card(rig, monkeypatch):
+    now = game.wall_time()
+    monkeypatch.setattr(game, "wall_time", lambda: now)
+    old = await start(rig)
+    await click(rig, old, correct(old))
+    deadline = old.deadline
+    await game.Chess.shutdown()
+    now += 400
+    await game.Chess.restore(rig.bot, rig.redis, rig.supervisor)
+    recovered = game.Chess.rounds[rig.message.chat.id]
+    assert recovered is not old and recovered.deadline == deadline
+    assert recovered.votes == old.votes and recovered.message.message_id == old.message.message_id
+    assert recovered.timer.when() - asyncio.get_running_loop().time() == pytest.approx(200, abs=0.1)
+    assert len([method for method in rig.session.methods if isinstance(method, SendPhoto)]) == 1
+    await click(rig, recovered, "finish")
+    assert recovered.revealed and snapshot(rig, recovered).revealed
+
+
+async def test_restart_finishes_overdue_round_on_deadline_day(rig):
+    old = await start(rig)
+    await click(rig, old, correct(old))
+    old.deadline = game.wall_time() - 1
+    await game.Chess.persist(old, rig.redis)
+    expected_day = datetime.fromtimestamp(old.deadline, game.DAY_ZONE).date()
+    await game.Chess.shutdown()
+    await game.Chess.restore(rig.bot, rig.redis, rig.supervisor)
+    recovered = game.Chess.rounds[rig.message.chat.id]
+    await settle(recovered)
+    assert recovered.closed and recovered.revealed and recovered.score_day == expected_day
+    assert rig.client.scores[game.score_key(rig.message.chat.id, expected_day)] == {"42": 1}
+    assert not game.Chess.rounds
+
+
+async def test_overdue_callback_cannot_accept_late_vote_when_timer_has_not_run(rig):
+    round_ = await start(rig)
+    round_.timer.cancel()
+    round_.deadline = game.wall_time() - 1
+    await click(rig, round_, correct(round_))
+    assert not round_.votes and round_.closed
+    await settle(round_)
+    assert round_.revealed and not game.Chess.rounds
+
+
+async def test_closure_is_durable_before_scoring_and_new_round_is_not_blocked_by_edit_lock(rig, monkeypatch):
+    monkeypatch.setattr(game, "UPDATE_TIMEOUT", 0.02)
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    applied = rig.client.apply
+
+    async def check_saved_closure(*args):
+        saved = snapshot(rig, round_)
+        assert saved.closed and saved.score_day == DAY
+        return await applied(*args)
+
+    rig.client.eval.side_effect = check_saved_closure
+    await round_.board_lock.acquire()
+    try:
+        await asyncio.wait_for(click(rig, round_, "finish"), timeout=0.2)
+        assert round_.scored and not round_.revealed and not game.Chess.rounds
+        assert round_.timer is not None and not round_.timer.cancelled()
+        current = await start(rig)
+        assert current is not round_ and not current.closed
+    finally:
+        round_.board_lock.release()
+    task = game.Chess.start_finish(rig.message.chat.id, round_, rig.redis, rig.supervisor)
+    assert task is not None
+    await settle(round_)
+    assert round_.revealed and game.Chess.rounds[rig.message.chat.id] is current
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_failed_result_delivery_retries_automatically_without_a_click(rig, monkeypatch):
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.02)
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    rig.session.media_error = rig.session.caption_error = True
+    await click(rig, round_, "finish")
+    assert not round_.revealed and round_.scored and not game.Chess.rounds
+    delivered = asyncio.Event()
+
+    async def notice(method):
+        delivered.set()
+
+    rig.session.edit_hook = notice
+    rig.session.media_error = rig.session.caption_error = False
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+    await settle(round_)
+    assert round_.revealed and snapshot(rig, round_).revealed
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_score_retry_after_midnight_uses_frozen_day_and_rewrites_error_result(rig, monkeypatch):
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.02)
+    day = DAY
+    monkeypatch.setattr(game, "today", lambda: day)
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    rig.client.eval.side_effect = RuntimeError("Scores unavailable")
+    await click(rig, round_, "finish")
+    assert round_.scored is False and round_.revealed and round_.score_day == DAY
+    day = date(2026, 9, 18)
+    applied = asyncio.Event()
+
+    async def score(*args):
+        value = await rig.client.apply(*args)
+        applied.set()
+        return value
+
+    rig.client.eval.side_effect = score
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    await settle(round_)
+    assert round_.scored and round_.revealed and snapshot(rig, round_).score_day == DAY
+    assert rig.client.scores[game.score_key(rig.message.chat.id, DAY)] == {"42": 1}
+    assert rig.client.scores[game.score_key(rig.message.chat.id, day)] == {}
+    assert "Не удалось подтвердить" not in round_.view.caption
+
+
+async def test_failed_final_snapshot_retries_without_applying_scores_twice(rig, monkeypatch):
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.02)
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    lost = False
+    persisted = asyncio.Event()
+
+    async def lose_one_final_reply(kind, state, redis):
+        nonlocal lost
+        if state.closed and state.scored and state.revealed:
+            if not lost:
+                lost = True
+                raise TimeoutError("Final save lost")
+            await rig.snapshots.put(kind, state, redis)
+            persisted.set()
+        else:
+            await rig.snapshots.put(kind, state, redis)
+
+    rig.snapshots.save.side_effect = lose_one_final_reply
+    await click(rig, round_, "finish")
+    assert lost and round_.scored and not round_.revealed and not round_.timer.cancelled()
+    await asyncio.wait_for(persisted.wait(), timeout=1)
+    await settle(round_)
+    assert round_.revealed and snapshot(rig, round_).revealed
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_concurrent_lazy_loads_share_one_round_and_keep_both_votes(rig):
+    old = await start(rig)
+    await game.Chess.shutdown()
+    loaded = 0
+    both = asyncio.Event()
+
+    async def load(*args):
+        nonlocal loaded
+        state = await rig.snapshots.get(*args)
+        loaded += 1
+        if loaded == 2:
+            both.set()
+        await both.wait()
+        return state
+
+    rig.snapshots.load.side_effect = load
+    await asyncio.gather(click(rig, old, correct(old), user_id=42), click(rig, old, correct(old), user_id=43))
+    recovered = game.Chess.rounds[rig.message.chat.id]
+    assert recovered is not old and set(recovered.votes) == {42, 43}
+    assert snapshot(rig, recovered).votes == recovered.votes
+
+
+async def test_shutdown_cancels_retry_timer_without_discarding_saved_failure(rig, monkeypatch):
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.02)
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    rig.client.eval.side_effect = RuntimeError("Scores unavailable")
+    await click(rig, round_, "finish")
+    retry = round_.timer
+    assert not retry.cancelled()
+    await game.Chess.shutdown()
+    await asyncio.sleep(0.04)
+    assert retry.cancelled() and not game.Chess.completed
+    rig.client.eval.assert_awaited_once()
+    assert snapshot(rig, round_).closed and snapshot(rig, round_).scored is False
+
+
+async def test_restore_old_active_snapshot_does_not_replace_a_newer_game(rig):
+    old = await start(rig)
+    old.timer.cancel()
+    game.Chess.rounds.clear()
+    current = await start(rig)
+    await game.Chess.restore(rig.bot, rig.redis, rig.supervisor)
+    recovered_old = game.Chess.completed[rig.message.chat.id, old.token]
+    await settle(recovered_old)
+    assert recovered_old.closed and game.Chess.rounds[rig.message.chat.id] is current
+    assert not current.closed and not current.timer.cancelled()
+
+
+async def test_retry_stops_at_snapshot_retention_boundary(rig):
+    round_ = await start(rig)
+    round_.closed = True
+    round_.scored = False
+    round_.deadline = game.wall_time() - game.RESULT_TTL + 10
+    timer = round_.timer
+    game.Chess.arm_timer(rig.message.chat.id, round_, rig.redis, rig.supervisor)
+    assert timer.cancelled()
+
+
+async def test_slow_duplicate_acknowledgement_does_not_hold_state_lock_or_block_completion(rig, monkeypatch):
+    round_ = await start(rig)
+    await click(rig, round_, correct(round_))
+    blocked, release = asyncio.Event(), asyncio.Event()
+    send = game._send
+
+    async def delay_duplicate(method):
+        if isinstance(method, AnswerCallbackQuery) and "уже принят" in (method.text or ""):
+            blocked.set()
+            await release.wait()
+        return await send(method)
+
+    monkeypatch.setattr(game, "_send", delay_duplicate)
+    duplicate = asyncio.create_task(click(rig, round_, correct(round_)))
+    try:
+        await asyncio.wait_for(blocked.wait(), timeout=1)
+        game.Chess.start_finish(rig.message.chat.id, round_, rig.redis, rig.supervisor)
+        await settle(round_)
+        assert round_.scored and round_.revealed and not game.Chess.rounds
+        assert not duplicate.done()
+    finally:
+        release.set()
+        await duplicate
+
+
+async def test_restart_retries_closed_unscored_round_with_its_original_day(rig, monkeypatch):
+    old = await start(rig)
+    await click(rig, old, correct(old))
+    rig.client.eval.side_effect = RuntimeError("Scores unavailable")
+    await click(rig, old, "finish")
+    assert snapshot(rig, old).closed and snapshot(rig, old).score_day == DAY
+    await game.Chess.shutdown()
+    monkeypatch.setattr(game, "today", lambda: date(2026, 9, 18))
+    rig.client.eval.side_effect = rig.client.apply
+    await game.Chess.restore(rig.bot, rig.redis, rig.supervisor)
+    recovered = game.Chess.completed[rig.message.chat.id, old.token]
+    await settle(recovered)
+    assert recovered.score_day == DAY and recovered.scored and recovered.revealed
+    assert rig.client.scores[game.score_key(rig.message.chat.id, DAY)] == {"42": 1}
+    assert snapshot(rig, recovered).revealed
