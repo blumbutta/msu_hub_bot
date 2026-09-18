@@ -58,7 +58,7 @@ class GameSession(RecordingSession):
 
 
 @pytest.fixture
-async def rig(monkeypatch):
+async def rig(monkeypatch, saved_quizzes):
     monkeypatch.setattr(game.Geoguess, "rounds", {})
     monkeypatch.setattr(game.Geoguess, "recent_countries", game.LRUCache(maxsize=1024))
     monkeypatch.setattr(game.Geoguess, "completed", game.TTLCache(maxsize=128, ttl=game.RESULT_TTL))
@@ -76,6 +76,7 @@ async def rig(monkeypatch):
         client=client,
         redis=SimpleNamespace(redis=AsyncMock(return_value=client)),
         supervisor=supervisor,
+        snapshots=saved_quizzes,
     )
     await game.Geoguess.shutdown()
     await supervisor.drain(timeout=1, cancel_timeout=0.5)
@@ -403,3 +404,187 @@ async def test_timer_during_closed_admission_releases_round_cleanly(rig):
     assert round_.closed and round_.timer.cancelled() and not game.Geoguess.rounds
     assert rig.supervisor.job_count == 0
     rig.client.eval.assert_not_awaited()
+
+
+async def wait_until(predicate):
+    async with asyncio.timeout(1):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+async def test_restart_restores_original_deadline_and_votes(rig, monkeypatch):
+    monkeypatch.setattr(game, "ROUND_TIMEOUT", 0.15)
+    original = await start(rig)
+    await click(rig, original, original.options.index(PHOTO.country))
+    await game.Geoguess.shutdown()
+    await game.Geoguess.restore(rig.bot, rig.redis, rig.supervisor)
+    restored = game.Geoguess.rounds[rig.message.chat.id]
+    assert restored is not original and restored.deadline == original.deadline
+    assert restored.votes == original.votes and restored.message.message_id == original.message.message_id
+    await wait_until(lambda: restored.revealed)
+    assert restored.scored and not game.Geoguess.rounds
+    rig.client.eval.assert_awaited_once()
+    assert len([method for method in rig.session.methods if isinstance(method, SendPhoto)]) == 1
+
+
+async def test_restart_after_deadline_reveals_without_waiting_another_ten_minutes(rig):
+    original = await start(rig)
+    await click(rig, original, 0)
+    original.deadline = game.wall_time.time() - 20
+    await game.Geoguess.persist(original, rig.redis)
+    await game.Geoguess.shutdown()
+    await game.Geoguess.restore(rig.bot, rig.redis, rig.supervisor)
+    restored = game.Geoguess.rounds[rig.message.chat.id]
+    await wait_until(lambda: restored.revealed)
+    assert not game.Geoguess.rounds
+    assert restored.score_day == game.datetime.fromtimestamp(original.deadline, game.DAY_ZONE).date()
+
+
+async def test_failed_final_edit_retries_automatically_without_new_votes_or_scoring(rig, monkeypatch):
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.03)
+    original = await start(rig)
+    await click(rig, original, 0)
+    rig.session.caption_error = True
+    await click(rig, original, "finish")
+    assert original.closed and original.scored and not original.revealed
+    assert not game.Geoguess.rounds
+    rig.session.caption_error = False
+    await wait_until(lambda: original.revealed)
+    rig.client.eval.assert_awaited_once()
+    assert original.timer.cancelled()
+
+
+async def test_restart_recovers_failed_reveal_and_keeps_same_score_date(rig):
+    original = await start(rig)
+    await click(rig, original, 0)
+    rig.session.caption_error = True
+    await click(rig, original, "finish")
+    day = original.score_day
+    await game.Geoguess.shutdown()
+    rig.session.caption_error = False
+    await game.Geoguess.restore(rig.bot, rig.redis, rig.supervisor)
+    restored = game.Geoguess.completed[rig.message.chat.id, original.token]
+    await wait_until(lambda: restored.revealed)
+    assert restored.score_day == day
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_late_vote_rejected_even_before_timer_callback(rig):
+    original = await start(rig)
+    original.deadline = game.wall_time.time() - 1
+    await click(rig, original, 0)
+    await wait_until(lambda: original.revealed)
+    assert not original.votes
+    rig.client.eval.assert_not_awaited()
+
+
+async def test_busy_caption_cannot_keep_chat_reserved_forever(rig, monkeypatch):
+    monkeypatch.setattr(game, "FINISH_TIMEOUT", 0.02)
+    monkeypatch.setattr(game, "RETRY_INTERVAL", 0.04)
+    original = await start(rig)
+    await click(rig, original, 0)
+    await original.board_lock.acquire()
+    try:
+        await click(rig, original, "finish")
+        assert not game.Geoguess.rounds and original.scored and not original.revealed
+        assert original.timer and not original.timer.cancelled()
+    finally:
+        original.board_lock.release()
+    await wait_until(lambda: original.revealed)
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_simultaneous_lazy_recovery_keeps_both_votes(rig):
+    original = await start(rig)
+    await game.Geoguess.shutdown()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def load(*args):
+        nonlocal calls
+        state = await rig.snapshots.get(*args)
+        calls += 1
+        if calls == 2:
+            entered.set()
+        await release.wait()
+        return state
+
+    rig.snapshots.load.side_effect = load
+    tasks = [asyncio.create_task(click(rig, original, 0, user_id=uid)) for uid in (42, 43)]
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        release.set()
+        await asyncio.gather(*tasks)
+        restored = game.Geoguess.rounds[rig.message.chat.id]
+        assert set(restored.votes) == {42, 43}
+        saved = await rig.snapshots.get("geoguess", rig.bot, rig.message.chat.id, original.token, rig.redis)
+        assert set(saved.votes) == {42, 43}
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_completed_caption_buttons_recover_after_memory_cache_eviction(rig):
+    original = await start(rig)
+    for uid in range(12):
+        await click(rig, original, 0, user_id=uid)
+    await click(rig, original, "finish")
+    await game.Geoguess.shutdown()
+    await click(rig, original, "page_1")
+    restored = game.Geoguess.completed[rig.message.chat.id, original.token]
+    assert restored.page == 1 and len(restored.votes) == 12
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_lost_vote_save_response_preserves_first_choice_and_retry_is_safe(rig):
+    original = await start(rig)
+
+    async def commit_then_timeout(*args):
+        await rig.snapshots.put(*args)
+        raise TimeoutError("synthetic lost Redis response after commit")
+
+    rig.snapshots.save.side_effect = commit_then_timeout
+    await click(rig, original, 0)
+    answer = [method for method in rig.session.methods if isinstance(method, AnswerCallbackQuery)][-1]
+    assert "Не удалось подтвердить" in answer.text
+    assert original.votes[42][0] == 0
+    rig.snapshots.save.side_effect = rig.snapshots.put
+    await click(rig, original, 1)
+    assert original.votes[42][0] == 0
+    saved = await rig.snapshots.get("geoguess", rig.bot, rig.message.chat.id, original.token, rig.redis)
+    assert saved.votes == original.votes
+    await game.Geoguess.shutdown()
+    await game.Geoguess.restore(rig.bot, rig.redis, rig.supervisor)
+    restored = game.Geoguess.rounds[rig.message.chat.id]
+    assert restored.votes == original.votes
+    await click(rig, restored, "finish")
+    rig.client.eval.assert_awaited_once()
+
+
+async def test_active_edit_finishing_late_does_not_acknowledge_failed_reveal(rig, monkeypatch):
+    original = await start(rig)
+    entered, release = asyncio.Event(), asyncio.Event()
+    send = game._send
+
+    async def interleaved(method):
+        if isinstance(method, EditMessageCaption):
+            if method.caption.startswith("🌍 На снимке"):
+                raise TelegramBadRequest(method=method, message="synthetic final edit failure")
+            entered.set()
+            await release.wait()
+        return await send(method)
+
+    monkeypatch.setattr(game, "_send", interleaved)
+    vote = asyncio.create_task(click(rig, original, 0))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        finish = game.Geoguess.start_finish(rig.message.chat.id, original, rig.redis, rig.supervisor)
+        await wait_until(lambda: original.scored is True)
+        release.set()
+        await vote
+        await finish
+        assert not original.revealed
+        assert original.timer is not None and not original.timer.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(vote, return_exceptions=True)
