@@ -25,7 +25,7 @@ def entity_text(caption: str, entity: MessageEntity) -> str:
     return raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
 
 
-def test_active_page_hides_answers_and_location_but_keeps_photo_credit():
+def test_active_page_hides_answers_location_and_photo_credit():
     players = [Player(11, "Первый", "first", "Норвегия", True), Player(12, "Второй", None, "Россия")]
     view = render(PHOTO, players, closed=False)
     assert "Ответили: 2" in view.caption
@@ -33,13 +33,33 @@ def test_active_page_hides_answers_and_location_but_keeps_photo_credit():
     assert "10 минут" in view.caption and "может любой" in view.caption
     assert "Выбор каждого покажу в конце" in view.caption
     assert all(hidden not in view.caption for hidden in ("Норвегия", "Россия", "Берген", "✓", "✗"))
-    assert PHOTO.author in view.caption and PHOTO.license in view.caption
+    assert PHOTO.author not in view.caption and PHOTO.license not in view.caption
     assert {entity.url for entity in view.entities if entity.url} == {
         "tg://user?id=11",
         "tg://user?id=12",
-        PHOTO.license_url,
     }
     assert (view.page, view.pages) == (0, 1)
+
+
+@pytest.mark.parametrize("player_count", [0, 1, 11])
+def test_every_active_page_hides_photo_metadata_and_external_links(player_count):
+    photo = replace(
+        PHOTO,
+        author="Фотограф из Бергена: https://example.test/bergen",
+        source="https://commons.wikimedia.org/wiki/File:Bergen_Norway.jpg",
+        license="CC BY — Norway",
+        license_url="https://creativecommons.org/licenses/by/3.0/no/",
+    )
+    players = [Player(index, f"Игрок {index}", None, photo.country, True) for index in range(player_count)]
+    for page in range(render(photo, players, closed=False).pages):
+        view = render(photo, players, closed=False, page=page)
+        assert all(
+            hidden not in view.caption
+            for hidden in (photo.author, photo.license, photo.source, photo.url, photo.license_url, "Берген", "Норвегия", "Norway")
+        )
+        assert all(entity.url is None or entity.url.startswith("tg://user?id=") for entity in view.entities)
+        assert "Фото:" not in view.caption and "Источник фотографии" not in view.caption
+        assert "Ответили" in view.caption and not view.caption.endswith("\n")
 
 
 @pytest.mark.parametrize("scored,expected", [(True, "Верно: +1, ошибка: −1"), (False, "Не удалось подтвердить"), (None, "Записываю")])
