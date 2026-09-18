@@ -1,7 +1,7 @@
 """Exercise the real composition root with offline provider/Telegram boundaries."""
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.enums import UpdateType
@@ -33,11 +33,14 @@ def boundaries(monkeypatch):
     monkeypatch.setattr(app, "AiohttpSession", lambda **kwargs: session)
     monkeypatch.setattr(app, "Redis", lambda **kwargs: client)
     monkeypatch.setattr(app, "create_repository", lambda *args, **kwargs: db)
+    monkeypatch.setattr(app.ChessPlay, "restore", AsyncMock())
+    monkeypatch.setattr(app.ChessPlay, "close", AsyncMock())
+    monkeypatch.setattr(app.ChessPlay, "open", Mock())
     return session, client, db
 
 
 async def test_composition_startup_and_idempotent_shutdown(app_settings, boundaries, monkeypatch):
-    from msu_hub_bot.app import Application
+    from msu_hub_bot.app import Application, ChessPlay
 
     session, client, db = boundaries
     application = await Application.create(app_settings)
@@ -50,11 +53,16 @@ async def test_composition_startup_and_idempotent_shutdown(app_settings, boundar
     assert [type(method) for method in session.methods] == [GetMe, DeleteWebhook]
     assert session.methods[-1].drop_pending_updates is False
     assert application._producer is not None
+    assert application._chess_play_recovery is not None
+    ChessPlay.open.assert_called_once_with()
+    ChessPlay.restore.assert_awaited_once_with(application.bot, application.redis, application.supervisor)
     await application.close()
     await application.close()
     client.aclose.assert_awaited_once()
     db.close.assert_awaited_once()
     assert session.closed and application._producer.done()
+    assert application._chess_play_recovery.done()
+    assert ChessPlay.close.await_count == 2
 
 
 async def test_partial_allocation_failure_closes_opened_clients(app_settings, boundaries, monkeypatch):
@@ -145,3 +153,78 @@ def test_health_requires_recent_successful_poll(monkeypatch, tmp_path):
     assert ready()
     heartbeat_path().write_text("800")
     assert not ready()
+
+
+async def test_chess_play_recovery_retries_without_preventing_startup(app_settings, boundaries, monkeypatch):
+    from msu_hub_bot import app
+
+    monkeypatch.setattr(app, "CHESS_PLAY_RECOVERY_SECONDS", 0.001)
+    recovered = asyncio.Event()
+    attempts = 0
+
+    async def restore(*args):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("Synthetic recovery outage")
+        recovered.set()
+
+    monkeypatch.setattr(app.ChessPlay, "restore", AsyncMock(side_effect=restore))
+    application = await app.Application.create(app_settings)
+    try:
+        await application.start()
+        await asyncio.wait_for(recovered.wait(), 1)
+        assert attempts >= 2
+        assert application._chess_play_recovery is not None and not application._chess_play_recovery.done()
+    finally:
+        await application.close()
+
+
+async def test_chess_play_producers_stop_before_worker_drain(app_settings, boundaries, monkeypatch):
+    from msu_hub_bot import app
+
+    application = await app.Application.create(app_settings)
+    await application.start()
+    order = []
+
+    async def close_chess():
+        assert application._chess_play_recovery.done()
+        assert application._producer.done()
+        assert not application.bot.session.closed
+        order.append("chess")
+
+    async def drain(**kwargs):
+        assert order == ["chess"]
+        order.append("drain")
+
+    monkeypatch.setattr(app.ChessPlay, "close", AsyncMock(side_effect=close_chess))
+    monkeypatch.setattr(application.supervisor, "drain", AsyncMock(side_effect=drain))
+    await application.close()
+    assert order == ["chess", "drain"]
+
+
+async def test_shutdown_cancels_pending_chess_play_recovery_before_closing_redis(app_settings, boundaries, monkeypatch):
+    from msu_hub_bot import app
+
+    session, client, _ = boundaries
+    application = await app.Application.create(app_settings)
+    await application.start()
+    entered, stopped = asyncio.Event(), asyncio.Event()
+
+    async def hanging_recovery(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert not session.closed
+            client.aclose.assert_not_awaited()
+            stopped.set()
+
+    monkeypatch.setattr(app.ChessPlay, "restore", AsyncMock(side_effect=hanging_recovery))
+    # Start a scan without changing asyncio.sleep for unrelated services.
+    application._chess_play_recovery.cancel()
+    await asyncio.gather(application._chess_play_recovery, return_exceptions=True)
+    application._chess_play_recovery = asyncio.create_task(application._restore_chess_play())
+    await entered.wait()
+    await application.close()
+    assert stopped.is_set() and session.closed
