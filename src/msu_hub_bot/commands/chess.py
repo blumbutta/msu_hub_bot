@@ -6,9 +6,11 @@ import secrets
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from time import time as wall_time
 from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
+from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
 from aiogram.methods import TelegramMethod
@@ -16,12 +18,14 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from aiogram.utils.formatting import Text
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from cachetools import LRUCache, TTLCache
+from pydantic import TypeAdapter
 
 from msu_hub_bot.commands.chess_view import Player, render
 from msu_hub_bot.commands.quiz_view import View, user_label
 from msu_hub_bot.media.chessboard import render_board
 from msu_hub_bot.providers.chess import MoveOption, Puzzle, random_puzzle
 from msu_hub_bot.providers.exceptions import ExternalServiceError
+from msu_hub_bot.telegram import quiz_store
 from msu_hub_bot.telegram.context import bot_for
 from msu_hub_bot.telegram.runtime import AdmissionClosed, Supervisor
 from msu_hub_bot.telegram.storage import RedisStorage
@@ -32,6 +36,9 @@ PHOTO_TIMEOUT = 10
 ROUND_TIMEOUT = 10 * 60
 EDIT_INTERVAL = 1.0
 RESULT_TTL = 24 * 60 * 60
+UPDATE_TIMEOUT = 40
+RETRY_INTERVAL = 30
+PUZZLE_ADAPTER = TypeAdapter(Puzzle)
 DAY_ZONE = ZoneInfo("Europe/Moscow")
 MAX_ROUNDS = 128
 _Result = TypeVar("_Result")
@@ -54,6 +61,9 @@ class Round:
     task: asyncio.Task[None] | None = None
     timer: asyncio.TimerHandle | None = None
     closed: bool = False
+    deadline: float = 0.0
+    score_day: date | None = None
+    revealed: bool = False
     scored: bool | None = None
     page: int = 0
     view: View | None = None
@@ -62,6 +72,7 @@ class Round:
     solution_photo: bytes | None = None
     solution_shown: bool = False
     board_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def today() -> date:
@@ -132,7 +143,13 @@ class Chess:
         try:
             await asyncio.wait_for(cls.send_round_photo(message, round_), timeout=PHOTO_TIMEOUT)
             started = True
-            round_.timer = asyncio.get_running_loop().call_later(ROUND_TIMEOUT, cls.start_finish, chat_id, round_, redis, supervisor)
+            try:
+                async with round_.state_lock:
+                    await cls.persist(round_, redis)
+            except Exception:
+                logger.exception("Chess initial state could not be saved")
+            finally:
+                cls.arm_timer(chat_id, round_, redis, supervisor)
         except ExternalServiceError, TelegramAPIError, asyncio.TimeoutError, ValueError, OSError:
             if round_.timer is not None:
                 round_.timer.cancel()
@@ -162,6 +179,7 @@ class Chess:
                 reply_markup=markup,
             )
         )
+        round_.deadline = wall_time() + ROUND_TIMEOUT
         round_.view, round_.markup = view, markup
         round_.last_edit = asyncio.get_running_loop().time()
         # A failed download, render or Telegram upload must not consume history.
@@ -201,18 +219,101 @@ class Chess:
             keyboard.row(*buttons)
         return keyboard.as_markup() if keyboard.export() else None
 
+    @staticmethod
+    async def persist(round_: Round, redis: RedisStorage) -> None:
+        assert round_.puzzle is not None and round_.message is not None
+        await quiz_store.save(
+            "chess",
+            quiz_store.SavedRound(
+                token=round_.token,
+                message=round_.message,
+                question=PUZZLE_ADAPTER.dump_json(round_.puzzle).decode(),
+                votes=round_.votes,
+                usernames=round_.usernames,
+                deadline=round_.deadline,
+                closed=round_.closed,
+                score_day=round_.score_day,
+                scored=round_.scored,
+                revealed=round_.revealed,
+            ),
+            redis,
+        )
+
+    @classmethod
+    def arm_timer(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> None:
+        if round_.timer is not None:
+            round_.timer.cancel()
+        if round_.closed:
+            delay: float = RETRY_INTERVAL
+            if round_.scored is True and round_.revealed:
+                return
+            if wall_time() + delay >= round_.deadline + RESULT_TTL:
+                return
+        else:
+            delay = max(0, round_.deadline - wall_time())
+        round_.timer = asyncio.get_running_loop().call_later(delay, cls.start_finish, chat_id, round_, redis, supervisor)
+
+    @classmethod
+    def recover(cls, saved: quiz_store.SavedRound, redis: RedisStorage, supervisor: Supervisor) -> Round:
+        chat_id = saved.message.chat.id
+        current = cls.rounds.get(chat_id)
+        if current is not None and current.token == saved.token:
+            return current
+        cached = cls.completed.get((chat_id, saved.token))
+        if cached is not None:
+            return cached
+        puzzle = PUZZLE_ADAPTER.validate_json(saved.question)
+        round_ = Round(
+            token=saved.token,
+            puzzle=puzzle,
+            options=list(puzzle.options),
+            message=saved.message,
+            votes=saved.votes,
+            usernames=saved.usernames,
+            deadline=saved.deadline,
+            closed=saved.closed,
+            score_day=saved.score_day,
+            scored=saved.scored,
+            revealed=saved.revealed,
+        )
+        if any(not 0 <= choice < len(round_.options) for choice, _ in round_.votes.values()):
+            raise ValueError("Invalid saved chess answer")
+        if round_.closed or current is not None:
+            cls.completed[chat_id, round_.token] = round_
+        else:
+            cls.rounds[chat_id] = round_
+        if round_.closed or round_.deadline <= wall_time() or current is not None:
+            cls.start_finish(chat_id, round_, redis, supervisor)
+        else:
+            cls.arm_timer(chat_id, round_, redis, supervisor)
+        return round_
+
+    @classmethod
+    async def restore(cls, bot: Bot, redis: RedisStorage, supervisor: Supervisor) -> None:
+        for saved in sorted(await quiz_store.pending("chess", bot, redis), key=lambda item: item.deadline, reverse=True):
+            try:
+                cls.recover(saved, redis, supervisor)
+            except ValueError:
+                logger.exception("Saved chess round is invalid")
+
     @classmethod
     def start_finish(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> asyncio.Task[None] | None:
         # Claim completion without yielding: a timer and a click may arrive together.
-        if cls.rounds.get(chat_id) is not round_ or round_.closed:
+        owned = cls.rounds.get(chat_id) is round_ or cls.completed.get((chat_id, round_.token)) is round_
+        if not owned or (round_.task is not None and not round_.task.done()):
             return None
-        round_.closed = True
+        if round_.closed and round_.scored is True and round_.revealed:
+            return None
+        if not round_.closed:
+            round_.closed = True
+        if round_.score_day is None:
+            round_.score_day = datetime.fromtimestamp(round_.deadline, DAY_ZONE).date() if wall_time() >= round_.deadline else today()
         if round_.timer is not None:
             round_.timer.cancel()
         try:
-            round_.task = supervisor.create_job(lambda: cls.finish(chat_id, round_, redis))
+            round_.task = supervisor.create_job(lambda: cls.finish(chat_id, round_, redis, supervisor))
         except AdmissionClosed:
-            cls.rounds.pop(chat_id, None)
+            # The saved snapshot is recovered by the next application instance.
             return None
         return round_.task
 
@@ -226,8 +327,17 @@ class Chess:
         round_ = cls.rounds.get(message.chat.id)
         if round_ is None or round_.token != callback_data.round:
             round_ = cls.completed.get((message.chat.id, callback_data.round))
+        if round_ is None:
+            try:
+                saved = await quiz_store.load("chess", bot_for(message), message.chat.id, callback_data.round, redis)
+                if saved is not None and saved.message.message_id == message.message_id:
+                    round_ = cls.recover(saved, redis, supervisor)
+            except Exception:
+                logger.exception("Chess round could not be restored")
         if round_ is None or round_.message is None or round_.message.message_id != message.message_id:
             return await _send(query.answer("Раунд недоступен. Начни новый: /chess", show_alert=True))
+        if not round_.closed and wall_time() >= round_.deadline:
+            cls.start_finish(message.chat.id, round_, redis, supervisor)
         if callback_data.choice.startswith("page_"):
             page = callback_data.choice.removeprefix("page_")
             if not page.isascii() or not page.isdecimal() or len(page) > 8:
@@ -241,8 +351,12 @@ class Chess:
             try:
                 await _send(query.answer("Раунд завершён. Начни новый: /chess", show_alert=True))
             finally:
-                # Old voting buttons can repair a failed reveal without rescoring.
-                await cls.update_board(round_, page=0)
+                # A retry uses the frozen score day and the round's idempotency key.
+                task = cls.start_finish(message.chat.id, round_, redis, supervisor)
+                if task is not None:
+                    await asyncio.shield(task)
+                elif round_.task is None or round_.task.done():
+                    await cls.update_board(round_, page=0)
             return None
         if callback_data.choice == "finish":
             task = cls.start_finish(message.chat.id, round_, redis, supervisor)
@@ -251,16 +365,34 @@ class Chess:
                 await asyncio.shield(task)
             return None
         user_id = query.from_user.id
-        if user_id in round_.votes:
-            return await _send(query.answer("Твой ответ уже принят. Изменить его нельзя.", show_alert=True))
         try:
             choice = int(callback_data.choice)
             if not 0 <= choice < len(round_.options):
                 raise ValueError
         except ValueError:
             return await _send(query.answer("Неизвестный вариант."))
-        round_.votes[user_id] = (choice, query.from_user.full_name)
-        round_.usernames[user_id] = query.from_user.username
+        feedback: str | None = None
+        async with round_.state_lock:
+            if round_.closed or wall_time() >= round_.deadline:
+                cls.start_finish(message.chat.id, round_, redis, supervisor)
+                feedback = "Раунд завершён. Начни новый: /chess"
+            else:
+                duplicate = user_id in round_.votes
+                if not duplicate:
+                    round_.votes[user_id] = (choice, query.from_user.full_name)
+                    round_.usernames[user_id] = query.from_user.username
+                try:
+                    # Keep the immutable choice if Redis committed but its reply was lost.
+                    # Repeating a click confirms the same snapshot before acknowledging it.
+                    await cls.persist(round_, redis)
+                except Exception:
+                    logger.exception("Chess vote persistence was not confirmed")
+                    feedback = "Не удалось подтвердить ответ. Нажми тот же вариант ещё раз."
+                else:
+                    if duplicate:
+                        feedback = "Твой ответ уже принят. Изменить его нельзя."
+        if feedback is not None:
+            return await _send(query.answer(feedback, show_alert=True))
         try:
             await _send(query.answer("Ответ принят! Результат — в конце раунда."))
         finally:
@@ -286,6 +418,14 @@ class Chess:
 
     @classmethod
     async def update_board(cls, round_: Round, *, page: int | None = None) -> None:
+        try:
+            async with asyncio.timeout(UPDATE_TIMEOUT):
+                await cls._update_board(round_, page=page)
+        except TimeoutError:
+            logger.warning("Chess result delivery timed out")
+
+    @classmethod
+    async def _update_board(cls, round_: Round, *, page: int | None = None) -> None:
         if round_.message is None or round_.puzzle is None:
             return
         async with round_.board_lock:
@@ -298,6 +438,8 @@ class Chess:
             markup = cls.keyboard(round_, view)
             needs_photo = round_.closed and not round_.solution_shown
             if view == round_.view and markup == round_.markup and not needs_photo:
+                if round_.closed:
+                    round_.revealed = True
                 return
             # Read state again after waiting so a burst of votes becomes one edit.
             await asyncio.sleep(max(0, round_.last_edit + EDIT_INTERVAL - asyncio.get_running_loop().time()))
@@ -306,6 +448,7 @@ class Chess:
             view = cls.render_view(round_)
             markup = cls.keyboard(round_, view)
             delivered = False
+            closed_view, scored_view = round_.closed, round_.scored
             if round_.closed and not round_.solution_shown:
                 if round_.solution_photo is None:
                     try:
@@ -335,38 +478,64 @@ class Chess:
                 )
             if delivered:
                 round_.page, round_.view, round_.markup = view.page, view, markup
+                if closed_view and round_.closed and scored_view == round_.scored and view == cls.render_view(round_):
+                    round_.revealed = True
 
     @classmethod
-    async def finish(cls, chat_id: int, round_: Round, redis: RedisStorage) -> None:
+    async def finish(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> None:
+        cancelled = False
+        persisted = False
         try:
-            round_.closed = True
-            day = today()
             puzzle = round_.puzzle
             if puzzle is None or round_.message is None:
                 return
-            scored = True
-            try:
-                players = [
-                    (uid, name, round_.usernames.get(uid), 1 if round_.options[choice].uci == puzzle.solution[0] else -1)
-                    for uid, (choice, name) in round_.votes.items()
-                ]
-                await asyncio.wait_for(save_scores(chat_id, players, redis, day, round_token=round_.token), timeout=5)
-            except Exception:
-                scored = False
-                logger.exception("Chess score update failed")
-            round_.scored = scored
-            # Keep result pages and failed reveals available after freeing the chat.
+            async with round_.state_lock:
+                # Freeze closure/day durably before the idempotent scoring operation.
+                if round_.score_day is None:
+                    round_.score_day = today()
+                try:
+                    await cls.persist(round_, redis)
+                except Exception:
+                    logger.exception("Chess closure could not be saved")
+                    if round_.scored is not True:
+                        round_.scored = False
+                else:
+                    if round_.scored is not True:
+                        try:
+                            players = [
+                                (uid, name, round_.usernames.get(uid), 1 if round_.options[choice].uci == puzzle.solution[0] else -1)
+                                for uid, (choice, name) in round_.votes.items()
+                            ]
+                            await asyncio.wait_for(
+                                save_scores(chat_id, players, redis, round_.score_day, round_token=round_.token), timeout=5
+                            )
+                            round_.scored = True
+                        except Exception:
+                            round_.scored = False
+                            logger.exception("Chess score update failed")
+                        round_.revealed = False
+            # Delivery cannot keep the next game blocked, even behind an edit lock.
             cls.completed[chat_id, round_.token] = round_
+            if cls.rounds.get(chat_id) is round_:
+                cls.rounds.pop(chat_id, None)
             await cls.update_board(round_, page=0)
+            async with round_.state_lock:
+                await cls.persist(round_, redis)
+                persisted = True
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception:
             logger.exception("Chess round could not be completed")
         finally:
-            if round_.timer is not None:
-                round_.timer.cancel()
-            if cls.rounds.get(chat_id) is round_:
+            if cls.rounds.get(chat_id) is round_ and round_.closed:
+                cls.completed[chat_id, round_.token] = round_
                 cls.rounds.pop(chat_id, None)
+            if not cancelled and (not persisted or round_.scored is not True or not round_.revealed):
+                # If the successful reveal was not saved, preserve a retry obligation.
+                if not persisted:
+                    round_.revealed = False
+                cls.arm_timer(chat_id, round_, redis, supervisor)
 
     @classmethod
     async def top(cls, message: Message, redis: RedisStorage) -> Message:
@@ -398,12 +567,14 @@ class Chess:
 
     @classmethod
     async def shutdown(cls) -> None:
-        for round_ in cls.rounds.values():
+        rounds = {id(round_): round_ for round_ in (*cls.rounds.values(), *cls.completed.values())}.values()
+        tasks = []
+        for round_ in rounds:
             if round_.timer is not None:
                 round_.timer.cancel()
-        tasks = [round_.task for round_ in cls.rounds.values() if round_.task]
-        for task in tasks:
-            task.cancel()
+            if round_.task is not None and not round_.task.done():
+                tasks.append(round_.task)
+                round_.task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         cls.rounds.clear()
         cls.recent_puzzles.clear()

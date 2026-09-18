@@ -52,19 +52,17 @@ def _header(photo: Photo, players: Sequence[Player], *, closed: bool, scored: bo
 
 
 def _footer(photo: Photo, *, closed: bool, page: int, pages: int) -> Text:
+    navigation = f"Страница {page + 1}/{pages}" if pages > 1 else ""
+    if not closed:
+        return Text(navigation)
     credit = Text("Фото: ", compact(photo.author, 48), ", ", TextLink(compact(photo.license, 32), url=photo.license_url), ".")
-    source = (
-        Text(
-            "\n",
-            TextLink("Источник фотографии", url=photo.source),
-            " · ",
-            TextLink("© OpenStreetMap", url="https://www.openstreetmap.org/copyright"),
-        )
-        if closed
-        else Text()
+    source = Text(
+        "\n",
+        TextLink("Источник фотографии", url=photo.source),
+        " · ",
+        TextLink("© OpenStreetMap", url="https://www.openstreetmap.org/copyright"),
     )
-    navigation = f"\nСтраница {page + 1}/{pages}" if pages > 1 else ""
-    return Text(credit, source, navigation)
+    return Text(credit, source, "\n" if navigation else "", navigation)
 
 
 def render(photo: Photo, players: Sequence[Player], *, closed: bool, scored: bool | None = True, page: int = 0) -> View:
@@ -89,5 +87,5 @@ def render(photo: Photo, players: Sequence[Player], *, closed: bool, scored: boo
     if not players and not closed:
         participants = Text("Пока никто не ответил. Твой ход!")
     body = Text(header, "\n\n", participants) if len(participants) else header
-    caption, entities = Text(body, "\n\n", footer).render()
+    caption, entities = (Text(body, "\n\n", footer) if len(footer) else body).render()
     return View(caption, entities, page, pages)

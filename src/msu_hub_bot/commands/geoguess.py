@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import secrets
+import time as wall_time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -9,6 +10,8 @@ from typing import Optional, TypeVar, cast
 from collections.abc import Awaitable
 
 from cachetools import LRUCache, TTLCache
+from pydantic import TypeAdapter
+from aiogram import Bot
 
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.filters.callback_data import CallbackData
@@ -19,6 +22,7 @@ from aiogram.utils.formatting import Text
 from msu_hub_bot.telegram.context import bot_for
 from msu_hub_bot.telegram.runtime import AdmissionClosed, Supervisor
 from msu_hub_bot.telegram.storage import RedisStorage
+from msu_hub_bot.telegram import quiz_store
 
 from msu_hub_bot.providers.exceptions import ExternalServiceError
 from msu_hub_bot.providers.geoguess import COUNTRIES, Photo, random_photo
@@ -33,6 +37,9 @@ DAY_ZONE = ZoneInfo("Europe/Moscow")
 EDIT_INTERVAL = 1.0
 RESULT_TTL = 24 * 60 * 60
 MAX_ROUNDS = 128
+RETRY_INTERVAL = 30.0
+FINISH_TIMEOUT = 45.0
+PHOTO_ADAPTER = TypeAdapter(Photo)
 _Result = TypeVar("_Result")
 
 
@@ -59,6 +66,11 @@ class Round:
     markup: InlineKeyboardMarkup | None = None
     last_edit: float = 0.0
     board_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    deadline: float = 0.0
+    score_day: date | None = None
+    revealed: bool = False
+    needs_save: bool = False
 
 
 def today() -> date:
@@ -129,7 +141,13 @@ class Geoguess:
         try:
             await asyncio.wait_for(cls.send_round_photo(message, round_), timeout=PHOTO_TIMEOUT)
             started = True
-            round_.timer = asyncio.get_running_loop().call_later(ROUND_TIMEOUT, cls.start_finish, chat_id, round_, redis, supervisor)
+            round_.deadline = wall_time.time() + ROUND_TIMEOUT
+            # Arm first: a slow/unavailable state store must not lose the live timer.
+            cls.arm(chat_id, round_, redis, supervisor)
+            try:
+                await cls.persist(round_, redis)
+            except Exception:
+                logger.exception("Geoguess initial round snapshot failed")
         except ExternalServiceError, TelegramAPIError, asyncio.TimeoutError:
             if round_.timer is not None:
                 round_.timer.cancel()
@@ -160,18 +178,117 @@ class Geoguess:
         # Remember only delivered questions; failed starts must not affect selection.
         cls.recent_countries[chat_id] = (*recent, photo.country)[-15:]
 
+    @staticmethod
+    async def save_state(round_: Round, redis: RedisStorage) -> None:
+        assert round_.message is not None and round_.photo is not None
+        await quiz_store.save(
+            "geoguess",
+            quiz_store.SavedRound(
+                token=round_.token,
+                message=round_.message,
+                question=PHOTO_ADAPTER.dump_json(round_.photo).decode(),
+                options=round_.options,
+                votes=round_.votes,
+                usernames=round_.usernames,
+                deadline=round_.deadline,
+                closed=round_.closed,
+                score_day=round_.score_day,
+                scored=round_.scored,
+                revealed=round_.revealed,
+            ),
+            redis,
+        )
+
+    @classmethod
+    async def persist(cls, round_: Round, redis: RedisStorage) -> None:
+        # Snapshot current state after taking the lock; older vote writes cannot
+        # overwrite a newer closure, even when Redis responds out of order.
+        async with round_.state_lock:
+            await cls.save_state(round_, redis)
+
+    @staticmethod
+    def from_state(state: quiz_store.SavedRound) -> Round:
+        photo = PHOTO_ADAPTER.validate_json(state.question)
+        if (
+            len(state.options) != 6
+            or photo.country not in state.options
+            or any(not 0 <= choice < len(state.options) for choice, _ in state.votes.values())
+        ):
+            raise ValueError("Invalid stored GeoGuess options")
+        return Round(
+            token=state.token,
+            photo=photo,
+            options=state.options,
+            message=state.message,
+            votes=state.votes,
+            usernames=state.usernames,
+            deadline=state.deadline,
+            closed=state.closed,
+            score_day=state.score_day,
+            scored=state.scored,
+            revealed=state.revealed,
+        )
+
+    @classmethod
+    def arm(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> None:
+        if round_.timer is not None:
+            round_.timer.cancel()
+        delay = RETRY_INTERVAL if round_.closed else max(0, round_.deadline - wall_time.time())
+        round_.timer = asyncio.get_running_loop().call_later(delay, cls.start_finish, chat_id, round_, redis, supervisor)
+
+    @classmethod
+    async def restore(cls, bot: Bot, redis: RedisStorage, supervisor: Supervisor) -> None:
+        for state in sorted(await quiz_store.pending("geoguess", bot, redis), key=lambda saved: saved.deadline, reverse=True):
+            chat_id = state.message.chat.id
+            existing = cls.rounds.get(chat_id)
+            if (existing is not None and existing.token == state.token) or (chat_id, state.token) in cls.completed:
+                continue
+            try:
+                round_ = cls.from_state(state)
+            except ValueError:
+                logger.warning("Invalid saved GeoGuess round")
+                continue
+            if round_.closed:
+                cls.completed[chat_id, round_.token] = round_
+                cls.start_finish(chat_id, round_, redis, supervisor)
+            elif existing is None:
+                cls.rounds[chat_id] = round_
+                cls.arm(chat_id, round_, redis, supervisor)
+            else:
+                # A newer round may have started while recovery was unavailable.
+                # Finish the older message without replacing that active game.
+                round_.closed = True
+                round_.score_day = datetime.fromtimestamp(min(round_.deadline, wall_time.time()), DAY_ZONE).date()
+                cls.completed[chat_id, round_.token] = round_
+                cls.start_finish(chat_id, round_, redis, supervisor)
+
     @classmethod
     def start_finish(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor) -> asyncio.Task[None] | None:
-        # Both the timer and buttons claim completion before yielding control.
-        if cls.rounds.get(chat_id) is not round_ or round_.closed:
+        # Claim completion without yielding, including a simultaneous button/timer.
+        if cls.rounds.get(chat_id) is not round_ and cls.completed.get((chat_id, round_.token)) is not round_:
             return None
-        round_.closed = True
+        if round_.task is not None and not round_.task.done():
+            return round_.task
+        if round_.closed and round_.revealed and round_.scored is True and not round_.needs_save:
+            return None
+        if not round_.closed:
+            if cls.rounds.get(chat_id) is not round_:
+                return None
+            round_.closed = True
+            round_.score_day = (
+                datetime.fromtimestamp(round_.deadline, DAY_ZONE).date()
+                if round_.deadline and wall_time.time() >= round_.deadline
+                else today()
+            )
         if round_.timer is not None:
             round_.timer.cancel()
         try:
-            round_.task = supervisor.create_job(lambda: cls.finish(chat_id, round_, redis))
+            round_.task = supervisor.create_job(lambda: cls.finish(chat_id, round_, redis, supervisor))
         except AdmissionClosed:
-            cls.rounds.pop(chat_id, None)
+            # The durable deadline is recovered by the next process.
+            if cls.rounds.get(chat_id) is round_:
+                cls.rounds.pop(chat_id, None)
+            cls.completed[chat_id, round_.token] = round_
             return None
         return round_.task
 
@@ -185,8 +302,31 @@ class Geoguess:
         round_ = cls.rounds.get(message.chat.id)
         if round_ is None or round_.token != callback_data.round:
             round_ = cls.completed.get((message.chat.id, callback_data.round))
+        if round_ is None:
+            try:
+                state = await quiz_store.load("geoguess", bot_for(message), message.chat.id, callback_data.round, redis)
+                if state is not None:
+                    active = cls.rounds.get(message.chat.id)
+                    round_ = (
+                        active if active is not None and active.token == state.token else cls.completed.get((message.chat.id, state.token))
+                    )
+                    round_ = round_ or cls.from_state(state)
+                    if round_.closed:
+                        cls.completed[message.chat.id, round_.token] = round_
+                    elif message.chat.id not in cls.rounds:
+                        cls.rounds[message.chat.id] = round_
+                        cls.arm(message.chat.id, round_, redis, supervisor)
+                    elif cls.rounds[message.chat.id] is not round_:
+                        round_.closed = True
+                        round_.score_day = datetime.fromtimestamp(min(round_.deadline, wall_time.time()), DAY_ZONE).date()
+                        cls.completed[message.chat.id, round_.token] = round_
+                        cls.start_finish(message.chat.id, round_, redis, supervisor)
+            except Exception:
+                logger.exception("Geoguess round recovery failed")
         if round_ is None or round_.message is None or round_.message.message_id != message.message_id:
             return await _send(query.answer("Раунд недоступен. Начни новый: /geoguess", show_alert=True))
+        if not round_.closed and round_.deadline and wall_time.time() >= round_.deadline:
+            cls.start_finish(message.chat.id, round_, redis, supervisor)
         if callback_data.choice.startswith("page_"):
             page = callback_data.choice.removeprefix("page_")
             if not page.isascii() or not page.isdecimal() or len(page) > 8:
@@ -200,8 +340,14 @@ class Geoguess:
             try:
                 await _send(query.answer("Раунд завершён. Начни новый: /geoguess", show_alert=True))
             finally:
-                # A failed reveal leaves voting buttons visible; they can retry it.
-                await cls.update_board(round_, page=0)
+                # Retry score/delivery failures as well as expired visible buttons.
+                busy = round_.task is not None and not round_.task.done()
+                if not busy:
+                    task = cls.start_finish(message.chat.id, round_, redis, supervisor)
+                    if task is not None:
+                        await asyncio.shield(task)
+                    else:
+                        await cls.update_board(round_, page=0)
             return None
         if callback_data.choice == "finish":
             task = cls.start_finish(message.chat.id, round_, redis, supervisor)
@@ -211,19 +357,34 @@ class Geoguess:
                 await asyncio.shield(task)
             return None
         user_id = query.from_user.id
-        if user_id in round_.votes:
-            return await _send(query.answer("Твой ответ уже принят. Изменить его нельзя.", show_alert=True))
         try:
             choice = int(callback_data.choice)
             if not 0 <= choice < len(round_.options):
                 raise ValueError
         except KeyError, ValueError:
             return await _send(query.answer("Неизвестный вариант."))
-        # No await between checking and recording: simultaneous clicks cannot vote twice.
-        round_.votes[user_id] = (choice, query.from_user.full_name)
-        round_.usernames[user_id] = query.from_user.username
+        answer = "Ответ принят! Результат — в конце раунда."
+        alert = False
+        async with round_.state_lock:
+            if round_.closed or (round_.deadline and wall_time.time() >= round_.deadline):
+                cls.start_finish(message.chat.id, round_, redis, supervisor)
+                answer = "Задание уже завершено."
+            else:
+                duplicate = user_id in round_.votes
+                if not duplicate:
+                    round_.votes[user_id] = (choice, query.from_user.full_name)
+                    round_.usernames[user_id] = query.from_user.username
+                try:
+                    await cls.save_state(round_, redis)
+                    if duplicate:
+                        answer, alert = "Твой ответ уже принят. Изменить его нельзя.", True
+                except Exception:
+                    # Redis may have committed before its response was lost. Keep
+                    # the first choice and persist it again on a user's retry.
+                    logger.exception("Geoguess vote persistence could not be confirmed")
+                    answer, alert = "Не удалось подтвердить ответ. Нажми тот же вариант ещё раз.", True
         try:
-            await _send(query.answer("Ответ принят! Результат — в конце раунда."))
+            await _send(query.answer(answer, show_alert=alert))
         finally:
             await cls.update_board(round_)
         return None
@@ -284,6 +445,7 @@ class Geoguess:
                 return
             view = cls.render_view(round_)
             markup = cls.keyboard(round_, view)
+            closed_view, scored_view = round_.closed, round_.scored
             try:
                 await _send(
                     round_.message.edit_caption(caption=view.caption, caption_entities=view.entities, parse_mode=None, reply_markup=markup)
@@ -298,38 +460,60 @@ class Geoguess:
             finally:
                 round_.last_edit = asyncio.get_running_loop().time()
             round_.page, round_.view, round_.markup = view.page, view, markup
+            if closed_view and round_.closed and scored_view == round_.scored and view == cls.render_view(round_):
+                round_.revealed = True
 
     @classmethod
-    async def finish(cls, chat_id: int, round_: Round, redis: RedisStorage) -> None:
+    async def finish(cls, chat_id: int, round_: Round, redis: RedisStorage, supervisor: Supervisor | None = None) -> None:
+        round_.closed = True
+        round_.score_day = round_.score_day or today()
+        saved = False
+        cancelled = False
         try:
-            round_.closed = True
-            day = today()  # A round belongs to the day it finishes, even across midnight.
-            photo = round_.photo
-            if photo is None or round_.message is None:
-                return
-            scored = True
-            try:
-                players = [
-                    (uid, name, round_.usernames.get(uid), 1 if round_.options[choice] == photo.country else -1)
-                    for uid, (choice, name) in round_.votes.items()
-                ]
-                await asyncio.wait_for(save_scores(chat_id, players, redis, day, round_token=round_.token), timeout=5)
-            except Exception:
-                scored = False
-                logger.exception("Geoguess score update failed")
-            round_.scored = scored
-            # Completed pages remain available without occupying the active chat slot.
-            cls.completed[chat_id, round_.token] = round_
-            await cls.update_board(round_, page=0)
+            async with asyncio.timeout(FINISH_TIMEOUT):
+                photo = round_.photo
+                if photo is None or round_.message is None:
+                    return
+                if round_.scored is not True:
+                    round_.revealed = False
+                    try:
+                        # Freeze the score date durably before the idempotent score
+                        # transaction. Restarting after midnight must not score twice.
+                        await cls.persist(round_, redis)
+                        players = [
+                            (uid, name, round_.usernames.get(uid), 1 if round_.options[choice] == photo.country else -1)
+                            for uid, (choice, name) in round_.votes.items()
+                        ]
+                        await asyncio.wait_for(save_scores(chat_id, players, redis, round_.score_day, round_token=round_.token), timeout=5)
+                        round_.scored = True
+                    except Exception:
+                        round_.scored = False
+                        logger.exception("Geoguess score update failed")
+                cls.completed[chat_id, round_.token] = round_
+                if cls.rounds.get(chat_id) is round_:
+                    cls.rounds.pop(chat_id, None)
+                await cls.update_board(round_, page=0)
+                await cls.persist(round_, redis)
+                saved = True
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception:
-            logger.exception("Geoguess round could not be completed")
+            logger.exception("Geoguess round completion will be retried")
         finally:
             if round_.timer is not None:
                 round_.timer.cancel()
+            cls.completed[chat_id, round_.token] = round_
             if cls.rounds.get(chat_id) is round_:
                 cls.rounds.pop(chat_id, None)
+            round_.needs_save = not saved
+            if (
+                not cancelled
+                and supervisor is not None
+                and (not saved or not round_.revealed or round_.scored is not True)
+                and wall_time.time() < round_.deadline + RESULT_TTL
+            ):
+                cls.arm(chat_id, round_, redis, supervisor)
 
     @classmethod
     async def top(cls, message: Message, redis: RedisStorage) -> Message:
@@ -361,10 +545,11 @@ class Geoguess:
 
     @classmethod
     async def shutdown(cls) -> None:
-        for round_ in cls.rounds.values():
+        rounds = {id(round_): round_ for round_ in (*cls.rounds.values(), *cls.completed.values())}.values()
+        for round_ in rounds:
             if round_.timer is not None:
                 round_.timer.cancel()
-        tasks = [round_.task for round_ in cls.rounds.values() if round_.task]
+        tasks = [round_.task for round_ in rounds if round_.task]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
