@@ -63,11 +63,11 @@ def check_media(audio):
         return subprocess.run(args, check=True, capture_output=True, timeout=60).stdout
 
     image = Image.new("RGB", (800, 180), "white")
-    ImageDraw.Draw(image).text((30, 35), "РџР РР’Р•Рў РњРР  314", font=ImageFont.truetype(str(ubuntu_mono_font), 72), fill="black")
+    ImageDraw.Draw(image).text((30, 35), "ПРИВЕТ МИР 314", font=ImageFont.truetype(str(ubuntu_mono_font), 72), fill="black")
     png = io.BytesIO()
     image.save(png, format="PNG")
     payload = png.getvalue()
-    assert to_text(io.BytesIO(payload)).strip() == "РџР РР’Р•Рў РњРР  314", "Cyrillic OCR failed"
+    assert to_text(io.BytesIO(payload)).strip() == "ПРИВЕТ МИР 314", "Cyrillic OCR failed"
     sticker = prepare_static(payload)
     with Image.open(io.BytesIO(sticker.payload)) as webp:
         assert webp.format == "WEBP" and max(webp.size) == 512
@@ -116,8 +116,8 @@ def check_captions(image_payload, video_payload):
     from msu_hub_bot.media.caption_video import caption_video
     from msu_hub_bot.resources import meme_font
 
-    assert ImageFont.truetype(str(meme_font), 24).getbbox("РџСЂРёРІРµС‚, РЃР¶!"), "Meme font is missing from the image"
-    text = 'РЃР¶: "РІСЃС‘ РЅРѕСЂРјР°Р»СЊРЅРѕ" [100%] \\ РїСѓС‚СЊ.\n' * 48
+    assert ImageFont.truetype(str(meme_font), 24).getbbox("Привет, Ёж!"), "Meme font is missing from the image"
+    text = 'Ёж: "всё нормально" [100%] \\ путь.\n' * 48
     with tempfile.TemporaryDirectory(prefix="hub-caption-smoke-") as directory:
         for style in ("lobster", "demotivator", "meme"):
             with io.BytesIO(image_payload) as source, closing(caption_image(source, text, style)) as image:
@@ -219,7 +219,7 @@ def check_animation():
         return isinstance(value, list) and any(has_outline(child) for child in value)
 
     for builder in (AnimateTextSticker, MatrixSticker):
-        result = animate(builder, "РЃР¶ Р№")
+        result = animate(builder, "Ёж й")
         assert result is not None
         payload = result.getvalue()
         assert len(payload) < 64 * 1024
@@ -310,11 +310,11 @@ def check_chess():
         token="a" * 12,
         bot_id=42,
         chat_id=-10012,
-        white=Player(user_id=1, name="Р‘РµР»С‹Рµ"),
+        white=Player(user_id=1, name="Белые"),
         created_at=1000,
         invite_deadline=1600,
     )
-    match.join(Player(user_id=2, name="Р§С‘СЂРЅС‹Рµ"), 1100)
+    match.join(Player(user_id=2, name="Чёрные"), 1100)
     for move in ("e2e4", "d7d5", "e4d5", "d8d5"):
         match.move(match.turn_player.user_id, move, 1100)
     assert captured_pieces(match) == ((chess.Piece(chess.PAWN, chess.BLACK),), (chess.Piece(chess.PAWN, chess.WHITE),))
@@ -372,15 +372,15 @@ async def main():
         from msu_hub_bot.resources import debate, lobster_font, times_new_roman_font, ubuntu_mono_font
 
         for font in (lobster_font, times_new_roman_font, ubuntu_mono_font):
-            assert ImageFont.truetype(str(font), 24).getbbox("РџСЂРёРІРµС‚, РЃР¶!"), font.name
+            assert ImageFont.truetype(str(font), 24).getbbox("Привет, Ёж!"), font.name
         with debate.open(encoding="utf-8", newline="") as source:
             rows = csv.reader(source, delimiter=";")
             assert len(next(rows)) == 7
             row = next(rows)
             assert len(row) == 7 and row[-1].strip()
-        post = VkPost({"id": 1, "owner_id": -1, "date": 0, "text": "РўРµРєСЃС‚ <example> &", "attachments": []}, {})
-        assert post.render(with_header=False) == "РўРµРєСЃС‚ &lt;example&gt; &amp;"
-        assert await asyncio.to_thread(sed_calc, "РџСЂРёРІРµС‚, РєРѕС‚!", ["s/РєРѕС‚/Р±РѕС‚/"]) == "РџСЂРёРІРµС‚, Р±РѕС‚!"
+        post = VkPost({"id": 1, "owner_id": -1, "date": 0, "text": "Текст <example> &", "attachments": []}, {})
+        assert post.render(with_header=False) == "Текст &lt;example&gt; &amp;"
+        assert await asyncio.to_thread(sed_calc, "Привет, кот!", ["s/кот/бот/"]) == "Привет, бот!"
     finally:
         await app.close()
     print(
