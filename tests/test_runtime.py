@@ -29,6 +29,7 @@ def boundaries(monkeypatch):
 
     session = RecordingSession()
     client = AsyncMock()
+    client.zscan.return_value = (0, [])
     db = AsyncMock()
     monkeypatch.setattr(app, "AiohttpSession", lambda **kwargs: session)
     monkeypatch.setattr(app, "Redis", lambda **kwargs: client)
@@ -49,12 +50,13 @@ async def test_composition_startup_and_idempotent_shutdown(app_settings, boundar
     db.check.assert_awaited_once_with()
     assert [type(method) for method in session.methods] == [GetMe, DeleteWebhook]
     assert session.methods[-1].drop_pending_updates is False
+    assert application._quiz_producer is not None
     assert application._producer is not None
     await application.close()
     await application.close()
     client.aclose.assert_awaited_once()
     db.close.assert_awaited_once()
-    assert session.closed and application._producer.done()
+    assert session.closed and application._producer.done() and application._quiz_producer.done()
 
 
 async def test_partial_allocation_failure_closes_opened_clients(app_settings, boundaries, monkeypatch):
@@ -145,3 +147,23 @@ def test_health_requires_recent_successful_poll(monkeypatch, tmp_path):
     assert ready()
     heartbeat_path().write_text("800")
     assert not ready()
+
+
+async def test_quiz_recovery_failure_does_not_skip_other_game(app_settings, boundaries, monkeypatch):
+    from msu_hub_bot import app
+
+    geo = AsyncMock(side_effect=TimeoutError("synthetic recovery failure"))
+    chess = AsyncMock()
+    monkeypatch.setattr(app.Geoguess, "restore", geo)
+    monkeypatch.setattr(app.Chess, "restore", chess)
+    application = await app.Application.create(app_settings)
+    try:
+        await application.start()
+        geo.assert_awaited_once_with(application.bot, application.redis, application.supervisor)
+        chess.assert_awaited_once_with(application.bot, application.redis, application.supervisor)
+        # A later maintenance scan retries after an unavailable startup store.
+        geo.side_effect = None
+        await application._restore_quizzes()
+        assert geo.await_count == chess.await_count == 2
+    finally:
+        await application.close()
