@@ -22,6 +22,36 @@ in memory; navigation is available for up to 24 hours within a bounded cache
 and ends on restart. The displayed result and saved daily scores remain.
 Lichess access is anonymous and subject to its shared request limits.
 
+## Chess with another player
+
+`/chess_play` opens one public invitation per chat, shared across forum topics.
+The creator plays white; the first other participant to accept plays black.
+Another invitation can start after the current invitation or game finishes.
+Players choose a piece and its destination using the board's buttons; only the
+player whose turn it is can move. Everyone in the chat can watch the same board.
+Piece buttons use chess symbols and square names. The board highlights the last
+move, shows captured pieces beside the board, and displays a result banner when
+the game ends.
+
+Each player starts with ten minutes, and a legal move adds five seconds to the
+moving player's clock. Only the current player's time runs. The caption refreshes
+about every five seconds and after moves; the server uses the exact deadline,
+so a stale display never grants extra time. A player who runs out of time loses.
+The final board names the winner or explains the draw.
+
+Game state, moves and clock deadlines are saved in Redis. Restarting the bot
+preserves the remaining time; time continues running during downtime. Expired
+games finish on recovery. No external chess service or engine is required.
+
+`/chess_rating` shows the global chess leaderboard across all bot chats.
+Players start at 800 Elo; completed games update both ratings with K=32 and
+show the change beside the result. There is no daily reset or automatic expiry.
+Expectations use the ratings recorded at the start of the game; the final
+change is applied atomically to each player's current total, so simultaneous
+games in different chats do not overwrite each other. Players appear after
+joining a game: the bot cannot enumerate every Telegram user. Rating records
+use the existing Redis service, whose persistence and backups must be retained.
+
 `/reactions` shows the chat's reaction receivers, givers, popular posts and emoji
 over 24 hours, seven days or thirty days. The bot needs administrator rights to
 collect new reactions; reaction state expires after thirty days. See
