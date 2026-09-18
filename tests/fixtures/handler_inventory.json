@@ -6888,5 +6888,160 @@
       "filters": [],
       "options": {}
     }
+  },
+  {
+    "type": "register_message_handler",
+    "handler": "ChessPlay.process",
+    "aliases": [
+      "chess_play"
+    ],
+    "routing": {
+      "key": "message:ChessPlay.process:chess_play",
+      "event": "message",
+      "filters": [
+        {
+          "type": "StateFilter",
+          "states": [
+            null
+          ]
+        },
+        {
+          "type": "ContentTypeFilter",
+          "content_types": [
+            "text"
+          ]
+        },
+        {
+          "type": "MetaCommand",
+          "commands": [
+            "chess_play"
+          ],
+          "prefixes": "/",
+          "ignore_case": true,
+          "ignore_mention": false,
+          "ignore_caption": false,
+          "args": null
+        }
+      ],
+      "runtime_aliases": [
+        "chess_play"
+      ]
+    },
+    "registration": {
+      "handler": "ChessPlay.process",
+      "filters": [
+        "MetaCommand('chess_play')"
+      ],
+      "options": {}
+    }
+  },
+  {
+    "type": "register_message_handler",
+    "handler": "ChessRating.process",
+    "aliases": [
+      "chess_rating"
+    ],
+    "routing": {
+      "key": "message:ChessRating.process:chess_rating",
+      "event": "message",
+      "filters": [
+        {
+          "type": "StateFilter",
+          "states": [
+            null
+          ]
+        },
+        {
+          "type": "ContentTypeFilter",
+          "content_types": [
+            "text"
+          ]
+        },
+        {
+          "type": "MetaCommand",
+          "commands": [
+            "chess_rating"
+          ],
+          "prefixes": "/",
+          "ignore_case": true,
+          "ignore_mention": false,
+          "ignore_caption": false,
+          "args": null
+        }
+      ],
+      "runtime_aliases": [
+        "chess_rating"
+      ]
+    },
+    "registration": {
+      "handler": "ChessRating.process",
+      "filters": [
+        "MetaCommand('chess_rating')"
+      ],
+      "options": {}
+    }
+  },
+  {
+    "type": "register_callback_query_handler",
+    "handler": "ChessPlay.callback",
+    "aliases": [],
+    "routing": {
+      "key": "callback_query:ChessPlay.callback",
+      "event": "callback_query",
+      "filters": [
+        {
+          "type": "CallbackDataFilter",
+          "prefix": "chplay",
+          "separator": ":",
+          "fields": [
+            "game",
+            "revision",
+            "action",
+            "value"
+          ],
+          "constraints": {}
+        }
+      ],
+      "runtime_aliases": []
+    },
+    "registration": {
+      "handler": "ChessPlay.callback",
+      "filters": [
+        "PlayCallback.filter()"
+      ],
+      "options": {
+        "state": "*"
+      }
+    }
+  },
+  {
+    "type": "register_callback_query_handler",
+    "handler": "ChessRating.callback",
+    "aliases": [],
+    "routing": {
+      "key": "callback_query:ChessRating.callback",
+      "event": "callback_query",
+      "filters": [
+        {
+          "type": "CallbackDataFilter",
+          "prefix": "chrate",
+          "separator": ":",
+          "fields": [
+            "page"
+          ],
+          "constraints": {}
+        }
+      ],
+      "runtime_aliases": []
+    },
+    "registration": {
+      "handler": "ChessRating.callback",
+      "filters": [
+        "RatingCallback.filter()"
+      ],
+      "options": {
+        "state": "*"
+      }
+    }
   }
 ]
