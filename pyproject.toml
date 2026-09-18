@@ -111,6 +111,7 @@ files = [
     "src/msu_hub_bot/telegram/middlewares/updates.py",
     "src/msu_hub_bot/telegram/middlewares/viewer.py",
     "src/msu_hub_bot/telegram/runtime.py",
+    "src/msu_hub_bot/telegram/quiz_store.py",
     "src/msu_hub_bot/telegram/state.py",
     "src/msu_hub_bot/telegram/storage.py",
     "src/msu_hub_bot/telegram/utils.py",

@@ -12,14 +12,22 @@ and configuration; see the bot's `/help` for commands.
 
 `/geoguess` asks you to locate a photo; `/chess` asks for the best move in a
 [Lichess puzzle](https://lichess.org/training). Each game keeps its question,
-solution and paginated results in one photo message. Votes stay hidden until
+solution and results in one photo message. Ordinary chess results fit on one
+page; extra pages are used only when the caption would exceed Telegram's limit.
+Votes stay hidden until
 anyone finishes the round or its ten-minute timer expires.
 
 `/geoguess_top` and `/chess_top` show separate daily chat rankings (Moscow time):
 a correct answer earns one point; an error loses one, with a floor of zero.
-Scores expire after the following day. Active rounds and result navigation live
-in memory; navigation is available for up to 24 hours within a bounded cache
-and ends on restart. The displayed result and saved daily scores remain.
+Scores expire after the following day. Round snapshots and their original
+deadlines are saved in Redis until 24 hours after the deadline. On restart,
+unfinished rounds resume; overdue rounds finish immediately after recovery.
+Failed score/reveal delivery is retried every 30 seconds during that retention
+period, with the same score date and idempotency key. Completed navigation can
+reload an evicted snapshot. Redis/Telegram outages may delay visible delivery,
+but do not extend voting past the stored deadline. A saved Redis snapshot is
+required for restart recovery; games from before this update cannot be recovered.
+Photo credits and source links in GeoGuess appear only after the round closes.
 Lichess access is anonymous and subject to its shared request limits.
 
 `/reactions` shows the chat's reaction receivers, givers, popular posts and emoji
