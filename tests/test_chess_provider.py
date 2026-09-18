@@ -117,8 +117,9 @@ def test_capture_solution_keeps_other_captures_in_the_displayed_answers():
     data["puzzle"].update(initialPly=1, solution=["h3h6", "h7g8"])
     puzzle = source.parse_puzzle(data)
     assert puzzle.fen == TACTICAL_FEN
-    assert sum(" × " in option.label for option in puzzle.options) == 3
-    assert sum(" → " in option.label for option in puzzle.options) == 3
+    board = chess.Board(puzzle.fen)
+    assert sum(board.is_capture(chess.Move.from_uci(option.uci)) for option in puzzle.options) == 3
+    assert all(" → " in option.label and "×" not in option.label for option in puzzle.options)
     assert sum(option.uci == "h3h6" for option in puzzle.options) == 1
 
 
@@ -198,7 +199,7 @@ def test_en_passant_counts_as_a_capture_when_balancing_answers():
     choices = source.select_moves(board, correct, list(board.legal_moves))
     assert correct in choices
     assert sum(board.is_capture(move) for move in choices) == 3
-    assert source.move_label(board, correct) == "Пешка e5 × d6"
+    assert source.move_label(board, correct) == "Пешка e5 → d6"
 
 
 def test_full_game_pgn_is_stopped_at_puzzle_position():
@@ -328,9 +329,9 @@ def test_game_over_and_too_few_legal_moves_are_rejected():
     [
         (chess.STARTING_FEN, "g1f3", "Конь g1 → f3"),
         ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1", "Рокировка e1 → g1"),
-        ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "a1a8", "Ладья a1 × a8"),
+        ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "a1a8", "Ладья a1 → a8"),
         ("8/P7/8/8/8/8/7k/5K2 w - - 0 1", "a7a8n", "Пешка a7 → a8 = Конь"),
-        ("8/8/8/3pP3/8/8/7k/5K2 w - d6 0 1", "e5d6", "Пешка e5 × d6"),
+        ("8/8/8/3pP3/8/8/7k/5K2 w - d6 0 1", "e5d6", "Пешка e5 → d6"),
     ],
 )
 def test_explicit_move_labels_cover_castling_capture_promotion_and_en_passant(fen, uci, label):
