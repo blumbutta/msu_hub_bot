@@ -60,8 +60,11 @@ async def test_finished_pages_work_while_another_round_is_active(rig):
     game.Geoguess.completed.clear()
     before = len(edits(rig))
     await click(rig, previous, "page_1")
-    assert "недоступен" in rig.session.methods[-1].text
-    assert len(edits(rig)) == before
+    assert len(edits(rig)) == before + 1
+    restored = game.Geoguess.completed[rig.message.chat.id, previous.token]
+    assert restored.view.page == 1
+    assert game.Geoguess.rounds[rig.message.chat.id] is current
+    rig.client.eval.assert_awaited_once()
 
 
 @pytest.mark.parametrize("page", ["page_-1", "page_", "page_1.5", "page_١", "page_999999999"])
