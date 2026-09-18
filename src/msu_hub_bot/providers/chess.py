@@ -72,8 +72,7 @@ def move_label(board: chess.Board, move: chess.Move) -> str:
     if piece is None or move not in board.legal_moves:
         raise UnsuitablePuzzle("Illegal answer move")
     name = "Рокировка" if board.is_castling(move) else PIECE_NAMES[piece.piece_type]
-    arrow = "×" if board.is_capture(move) else "→"
-    label = f"{name} {chess.square_name(move.from_square)} {arrow} {chess.square_name(move.to_square)}"
+    label = f"{name} {chess.square_name(move.from_square)} → {chess.square_name(move.to_square)}"
     if move.promotion is not None:
         label += f" = {PIECE_NAMES[move.promotion]}"
     return label
