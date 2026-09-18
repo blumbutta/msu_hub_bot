@@ -42,6 +42,8 @@ from msu_hub_bot.commands.fun import matches_pokakats, process_beer, process_pok
 from msu_hub_bot.commands.genders import process_gender
 from msu_hub_bot.commands.geoguess import Geoguess
 from msu_hub_bot.commands.chess import Chess
+from msu_hub_bot.commands.chess_play import ChessPlay, ChessRating, RatingCallback
+from msu_hub_bot.commands.chess_play_view import PlayCallback
 from msu_hub_bot.commands.help import HelpMessage
 from msu_hub_bot.commands.infra import (
     process_create_infra_chat,
@@ -835,6 +837,30 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         Chess.callback_data.filter(),
         StateFilter(None),
         flags={"handler_key": "Chess.process_cb", "fsm_release": True},
+    )
+    group("chess_play").message.register(
+        ChessPlay.process,
+        MetaCommand("chess_play"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "ChessPlay.process", "fsm_release": True},
+    )
+    group("chess_play").message.register(
+        ChessRating.process,
+        MetaCommand("chess_rating"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "ChessRating.process", "fsm_release": True},
+    )
+    group("chess_play").callback_query.register(
+        ChessPlay.callback,
+        PlayCallback.filter(),
+        flags={"handler_key": "ChessPlay.callback", "fsm_release": True},
+    )
+    group("chess_play").callback_query.register(
+        ChessRating.callback,
+        RatingCallback.filter(),
+        flags={"handler_key": "ChessRating.callback", "fsm_release": True},
     )
     group("geoguess").message.register(
         Geoguess.process,
