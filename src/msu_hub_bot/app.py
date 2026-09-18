@@ -77,6 +77,7 @@ class Application:
     health: HealthCheck
     telemetry: Telemetry
     _producer: asyncio.Task[None] | None = None
+    _quiz_producer: asyncio.Task[None] | None = None
     _closed: bool = False
 
     @classmethod
@@ -210,6 +211,18 @@ class Application:
             except Exception:
                 logger.exception("Scheduled deletion scan failed")
 
+    async def _restore_quizzes(self) -> None:
+        for quiz in (Geoguess, Chess):
+            try:
+                await quiz.restore(self.bot, self.redis, self.supervisor)
+            except Exception:
+                logger.exception("Quiz recovery scan failed")
+
+    async def _quiz_recovery_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            await self._restore_quizzes()
+
     async def start(self) -> None:
         await self.telemetry.start()
         await self.database.check()
@@ -217,6 +230,8 @@ class Application:
         await self.bot.me()
         await self.bot.delete_webhook(drop_pending_updates=False)
         await self.health.start()
+        await self._restore_quizzes()
+        self._quiz_producer = asyncio.create_task(self._quiz_recovery_loop(), name="quiz-recovery")
         self._producer = asyncio.create_task(self._deletion_loop(), name="scheduled-deletions")
 
     async def close(self, *, hard_exit: Callable[[int], Any] = os._exit) -> None:
@@ -229,9 +244,10 @@ class Application:
         watchdog.start()
         self.supervisor.close_updates()
         try:
-            if self._producer is not None:
-                self._producer.cancel()
-                await asyncio.gather(self._producer, return_exceptions=True)
+            producers = [task for task in (self._producer, self._quiz_producer) if task is not None]
+            for task in producers:
+                task.cancel()
+            await asyncio.gather(*producers, return_exceptions=True)
             await self.health.stop()
             try:
                 await self.supervisor.drain(timeout=DRAIN_SECONDS, cancel_timeout=5)

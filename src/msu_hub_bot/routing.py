@@ -833,7 +833,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("chess").callback_query.register(
         Chess.process_cb,
         Chess.callback_data.filter(),
-        StateFilter(None),
+        # Chat rounds are independent of the actor's active FSM conversation.
         flags={"handler_key": "Chess.process_cb", "fsm_release": True},
     )
     group("geoguess").message.register(
@@ -853,7 +853,7 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
     group("geoguess").callback_query.register(
         Geoguess.process_cb,
         Geoguess.callback_data.filter(),
-        StateFilter(None),
+        # Chat rounds are independent of the actor's active FSM conversation.
         flags={"handler_key": "Geoguess.process_cb", "fsm_release": True},
     )
     group("other").message.register(
