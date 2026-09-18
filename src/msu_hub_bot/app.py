@@ -46,6 +46,7 @@ from msu_hub_bot.telegram.wrapper import BotWrapper
 from msu_hub_bot.providers.vk.api import VkApi
 from msu_hub_bot.commands.geoguess import Geoguess
 from msu_hub_bot.commands.chess import Chess
+from msu_hub_bot.commands.chess_play import ChessPlay
 from msu_hub_bot.events import EcosystemManager, EventsMiddleware
 from msu_hub_bot.routing import build_router
 from msu_hub_bot.providers.jdoodle import ManyJDoodle
@@ -62,6 +63,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_UPDATES: list[str] = [kind.value for kind in UpdateType]
 SHUTDOWN_SECONDS = 85.0
 DRAIN_SECONDS = 65.0
+CHESS_PLAY_RECOVERY_SECONDS = 30.0
 
 
 @dataclass
@@ -77,6 +79,7 @@ class Application:
     health: HealthCheck
     telemetry: Telemetry
     _producer: asyncio.Task[None] | None = None
+    _chess_play_recovery: asyncio.Task[None] | None = None
     _closed: bool = False
 
     @classmethod
@@ -136,6 +139,7 @@ class Application:
             stack.push_async_callback(preferences.close)
             stack.push_async_callback(Geoguess.shutdown)
             stack.push_async_callback(Chess.shutdown)
+            stack.push_async_callback(ChessPlay.close)
             ecosystem = EcosystemManager(bot, database)
             events = EventsMiddleware(bot, database, settings.events_chat_id, em=ecosystem)
 
@@ -210,6 +214,17 @@ class Application:
             except Exception:
                 logger.exception("Scheduled deletion scan failed")
 
+    async def _restore_chess_play(self) -> None:
+        try:
+            await ChessPlay.restore(self.bot, self.redis, self.supervisor)
+        except Exception:
+            logger.exception("Chess play recovery failed")
+
+    async def _chess_play_recovery_loop(self) -> None:
+        while True:
+            await asyncio.sleep(CHESS_PLAY_RECOVERY_SECONDS)
+            await self._restore_chess_play()
+
     async def start(self) -> None:
         await self.telemetry.start()
         await self.database.check()
@@ -217,6 +232,9 @@ class Application:
         await self.bot.me()
         await self.bot.delete_webhook(drop_pending_updates=False)
         await self.health.start()
+        ChessPlay.open()
+        await self._restore_chess_play()
+        self._chess_play_recovery = asyncio.create_task(self._chess_play_recovery_loop(), name="chess-play-recovery")
         self._producer = asyncio.create_task(self._deletion_loop(), name="scheduled-deletions")
 
     async def close(self, *, hard_exit: Callable[[int], Any] = os._exit) -> None:
@@ -229,9 +247,11 @@ class Application:
         watchdog.start()
         self.supervisor.close_updates()
         try:
-            if self._producer is not None:
-                self._producer.cancel()
-                await asyncio.gather(self._producer, return_exceptions=True)
+            producers = [task for task in (self._producer, self._chess_play_recovery) if task is not None]
+            for producer in producers:
+                producer.cancel()
+            await asyncio.gather(*producers, return_exceptions=True)
+            await ChessPlay.close()
             await self.health.stop()
             try:
                 await self.supervisor.drain(timeout=DRAIN_SECONDS, cancel_timeout=5)
