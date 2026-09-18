@@ -13,6 +13,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Update, User
 
 from msu_hub_bot.commands.chess import ChessCallback
+from msu_hub_bot.commands.chess_play_view import PlayCallback
+from msu_hub_bot.commands.chess_play import RatingCallback
+from msu_hub_bot.commands.prog import ProgStates
+from msu_hub_bot.commands.sticker import StickerStates
 from msu_hub_bot.commands.geoguess import GeoguessCallback
 from msu_hub_bot.commands.reactions import ReactionCallback
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
@@ -64,6 +68,10 @@ def is_added_route(handler):
         "Chess.process",
         "Chess.top",
         "Chess.process_cb",
+        "ChessPlay.process",
+        "ChessPlay.callback",
+        "ChessRating.process",
+        "ChessRating.callback",
         "process_meme",
         "Reactions.process",
         "Reactions.process_cb",
@@ -75,7 +83,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 5, "edited_message": 1, "callback_query": 2}.get(kind, 0)
+        extra = {"message": 7, "edited_message": 1, "callback_query": 4}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
@@ -158,6 +166,16 @@ async def chess_selection_dispatcher():
         ("/chess_top@contract_bot", "Chess.top"),
         ("/CHESS_TOP", "Chess.top"),
         ("/CHESS_TOP@CONTRACT_BOT", "Chess.top"),
+        ("/chess_play", "ChessPlay.process"),
+        ("/chess_play@contract_bot", "ChessPlay.process"),
+        ("/CHESS_PLAY", "ChessPlay.process"),
+        ("/CHESS_PLAY@CONTRACT_BOT", "ChessPlay.process"),
+        ("/chess_play@another_bot", None),
+        ("/chess_rating", "ChessRating.process"),
+        ("/chess_rating@contract_bot", "ChessRating.process"),
+        ("/CHESS_RATING", "ChessRating.process"),
+        ("/CHESS_RATING@CONTRACT_BOT", "ChessRating.process"),
+        ("/chess_rating@another_bot", None),
         ("/chess@another_bot", None),
         ("/chess_top@another_bot", None),
     ],
@@ -313,6 +331,11 @@ async def test_caption_styles_select_real_routes_in_text_and_media_captions(
         (ChessCallback(round="round-token", choice="finish").pack(), "Chess.process_cb"),
         (GeoguessCallback(round="round-token", choice="0").pack(), "Geoguess.process_cb"),
         (GeoguessCallback(round="round-token", choice="finish").pack(), "Geoguess.process_cb"),
+        (PlayCallback(game="game-token", revision=0, action="join").pack(), "ChessPlay.callback"),
+        (PlayCallback(game="game-token", revision=4, action="move", value="e2e4").pack(), "ChessPlay.callback"),
+        (RatingCallback(page=2).pack(), "ChessRating.callback"),
+        ("chrate:bad", "process_expired_callback"),
+        ("chplay:game-token:0", "process_expired_callback"),
         ("chessboard:round-token:0", "process_expired_callback"),
         ("chess:round-token", "process_expired_callback"),
     ],
@@ -441,3 +464,47 @@ async def test_ignored_chat_keeps_metrics_without_spending_command_trace_budget(
     assert "settings.load" in payload and "archive.write" in payload and "ignored" in payload
     assert "supabase" in payload
     assert private_text not in payload
+
+
+@pytest.mark.parametrize("state", [ProgStates.stdin, StickerStates.sticker_set_name])
+@pytest.mark.parametrize("action,value", [("join", ""), ("pick", "e2"), ("move", "e2e4"), ("resign", "")])
+async def test_chess_play_callbacks_remain_available_during_unrelated_fsm(state, action, value):
+    bot = make_bot()
+    dispatcher = Dispatcher(disable_fsm=True)
+    dispatcher.update.outer_middleware(StateContextMiddleware())
+    fsm = TopicFSMContextMiddleware(MemoryStorage(), ReleasableEventIsolation())
+    dispatcher.update.outer_middleware(fsm)
+    dispatcher.callback_query.middleware(SelectiveIsolationMiddleware())
+    dispatcher.callback_query.middleware(Selection())
+    dispatcher.include_router(router())
+    message = make_message(bot, message_thread_id=99, is_topic_message=True)
+    context = fsm.resolve_context(bot, message.chat.id, 42, thread_id=99)
+    await context.set_state(state)
+    await context.set_data({"draft": "unrelated conversation"})
+    query = CallbackQuery(
+        id="synthetic",
+        chat_instance="synthetic",
+        from_user=User(id=42, is_bot=False, first_name="Synthetic"),
+        message=message,
+        data=PlayCallback(game="game-token", revision=0, action=action, value=value).pack(),
+    )
+    try:
+        selected, _ = await asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, callback_query=query)))
+        assert selected.callback.__qualname__ == "ChessPlay.callback"
+        assert selected.flags["handler_key"] == "ChessPlay.callback"
+        assert selected.flags["fsm_release"] is True
+        assert await context.get_state() == state.state
+        assert await context.get_data() == {"draft": "unrelated conversation"}
+        assert bot.session.methods == []
+    finally:
+        await fsm.close()
+        await bot.session.close()
+
+
+async def test_chess_play_start_keeps_unrelated_fsm_policy(chess_selection_dispatcher):
+    bot, dispatcher = chess_selection_dispatcher
+    handler = next(handler for handler in routes(dispatcher, "message") if handler.flags["handler_key"] == "ChessPlay.process")
+    from aiogram.filters import StateFilter
+
+    filters = [item.callback for item in handler.filters if isinstance(item.callback, StateFilter)]
+    assert len(filters) == 1 and filters[0].states == (None,)
