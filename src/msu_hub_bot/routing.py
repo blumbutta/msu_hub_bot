@@ -41,6 +41,7 @@ from msu_hub_bot.commands.figlet import process_figlet
 from msu_hub_bot.commands.fun import matches_pokakats, process_beer, process_pokakats, process_puk
 from msu_hub_bot.commands.genders import process_gender
 from msu_hub_bot.commands.geoguess import Geoguess
+from msu_hub_bot.commands.quest import Quest
 from msu_hub_bot.commands.chess import Chess
 from msu_hub_bot.commands.chess_play import ChessPlay, ChessRating, RatingCallback
 from msu_hub_bot.commands.chess_play_view import PlayCallback
@@ -898,6 +899,19 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         RatingCallback.filter(),
         fsm_callback_allowed,
         flags={"handler_key": "ChessRating.callback", "fsm_release": True},
+    )
+    group("quest").message.register(
+        Quest.process,
+        MetaCommand("quest"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Quest.process", "fsm_release": True},
+    )
+    group("quest").callback_query.register(
+        Quest.callback,
+        Quest.callback_data.filter(),
+        fsm_callback_allowed,
+        flags={"handler_key": "Quest.callback", "fsm_release": True},
     )
     group("geoguess").message.register(
         Geoguess.process,
