@@ -301,6 +301,27 @@ unavailable response instead of a partial ranking. Navigation is bounded to the
 first 10,000 places; the personal rank counts every player. Chess actions never
 modify the user's active FSM conversation.
 
+### Cooperative quests
+
+`games/quest.py` stores one active quest per `chat:<id>`. The `games` document
+pins a story's content digest, progress, current scene text and choices, Telegram
+message identity and current vote deadline. Separate `votes` records preserve
+one mutable choice per user and scene; `chats` points at the active game.
+
+A new scene has no deadline. The first accepted vote atomically saves its
+absolute ten-minute deadline and schedules the worker. Later votes and changes
+keep that deadline. Manual settlement requires a vote and follows the same
+conditional transition as the timer: plurality wins, and a tie selects only
+among leaders. The selected index is persisted before loading the next scene,
+so retrying settlement does not reroll it. The next scene starts without votes
+or a timer. Completion releases the chat; finished records and their votes are
+cleaned after the 24-hour result window.
+
+The control message is text with paginated scene content and buttons; optional
+illustrations use a separate photo message. Presentation retries do not own the
+quest's progress or deadlines. A restart can reload the pinned story by ID;
+a changed or unsupported scenario is rejected rather than silently substituted.
+
 ### Telegram conversations and deletions
 
 `telegram/fsm_storage.py` implements aiogram `BaseStorage` through feature
