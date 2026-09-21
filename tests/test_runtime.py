@@ -51,6 +51,7 @@ async def test_composition_startup_and_idempotent_shutdown(app_settings, boundar
     assert application._membership_task is not None
     assert application.dispatcher.workflow_data["quiz"] is application.quiz
     assert application.dispatcher.workflow_data["chess_matches"] is application.chess_matches
+    assert application.dispatcher.workflow_data["quests"] is application.quests
     await application.close()
     await application.close()
     db.close.assert_awaited_once()
