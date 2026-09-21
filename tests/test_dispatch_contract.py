@@ -61,6 +61,8 @@ def aliases(handler):
 
 def is_added_route(handler):
     return aliases(handler) == ["py_stdin", "python_stdin"] or handler.flags["handler_key"] in {
+        "Quest.process",
+        "Quest.callback",
         "Chess.process",
         "Chess.top",
         "Chess.process_cb",
@@ -84,7 +86,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 11, "edited_message": 1, "callback_query": 5}.get(kind, 0)
+        extra = {"message": 12, "edited_message": 1, "callback_query": 6}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
