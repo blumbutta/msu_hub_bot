@@ -48,6 +48,20 @@ over 24 hours, seven days or thirty days. The bot needs administrator rights to
 collect new reactions; reaction state expires after thirty days. See
 [reaction scores and coverage](docs/reactions.md).
 
+## Cooperative quests
+
+`/quest` starts an original short demo; `/quest ID` loads a compatible public
+Meander story. The adapter supports branching scenes, author-provided images
+and endings; stories requiring inventory rules, conditions, text input or other
+unsupported mechanics are rejected before play. One quest runs per chat, across forum topics.
+
+Everyone can vote using the scene's buttons, and change their choice. A scene
+waits indefinitely for its first vote; that vote starts ten minutes. Anyone can
+finish the choice early once someone has voted. The most popular choice wins;
+a tie is resolved randomly among the leaders. Every new scene waits for its own
+first vote. Scene state, votes and deadlines survive restarts through the feature
+store. Long scene text has pages; illustrations appear as separate photo messages.
+
 ## Chess with friends
 
 `/chess_play` opens a public invitation in a group: the author plays white,
