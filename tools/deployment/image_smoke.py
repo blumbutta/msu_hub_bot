@@ -410,8 +410,8 @@ async def main():
         def count(event):
             return sum(len(router.observers[event].handlers) for router in app.dispatcher.chain_tail)
 
-        assert count("message") == 272
-        assert count("callback_query") == 24
+        assert count("message") == 273
+        assert count("callback_query") == 25
         assert count("edited_message") == 149
         assert count("inline_query") == count("chosen_inline_result") == 0
         from PIL import ImageFont
