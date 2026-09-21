@@ -24,6 +24,8 @@ from msu_hub_bot.storage.base import BotRepository
 from msu_hub_bot.storage.factory import create_repository
 from msu_hub_bot.storage.features import FeatureStore, FeatureWorker
 from msu_hub_bot.games import QuizService
+from msu_hub_bot.games.quest import QuestService
+from msu_hub_bot.providers.quest import QuestProvider
 from msu_hub_bot.games.raffle import RaffleStore
 from msu_hub_bot.games.chess_play.service import ChessMatchService
 from msu_hub_bot.reminders import ReminderService
@@ -89,6 +91,7 @@ class Application:
     feature_worker: FeatureWorker
     quiz: QuizService
     chess_matches: ChessMatchService
+    quests: QuestService
     reminders: ReminderService
     web_apps: WebAppLinks
     membership_inbox: MembershipInbox
@@ -131,6 +134,9 @@ class Application:
             quiz = QuizService(bot, features, feature_worker)
             raffles = RaffleStore(bot.id, features)
             chess_matches = ChessMatchService(bot, features, feature_worker)
+            quest_provider = QuestProvider()
+            stack.push_async_callback(quest_provider.close)
+            quests = QuestService(bot, features, feature_worker, quest_provider)
             reminders = ReminderService(bot, features, feature_worker)
             web_apps = WebAppLinks(bot.token, settings.web_app_url)
             feedback = FeedbackService(
@@ -214,6 +220,7 @@ class Application:
                 quiz=quiz,
                 raffles=raffles,
                 chess_matches=chess_matches,
+                quests=quests,
                 reminders=reminders,
                 feedback=feedback,
                 feedback_diagnostics=diagnostics,
@@ -268,6 +275,7 @@ class Application:
                 feature_worker,
                 quiz,
                 chess_matches,
+                quests,
                 reminders,
                 web_apps,
                 membership_inbox,
