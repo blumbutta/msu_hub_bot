@@ -11,8 +11,10 @@ from msu_hub_bot.storage.features import Payload
 class Question(Payload):
     """Freeze the question and answer order before publishing its buttons."""
 
-    kind: Literal["chess", "geoguess"]
+    kind: Literal["chess", "geoguess", "art"]
     identity: str
+    artwork_title: str | None = None
+    artwork_date: str | None = None
     choices: list[str] = Field(min_length=6, max_length=6)
     answer: int = Field(ge=0, lt=6)
     fen: str | None = None

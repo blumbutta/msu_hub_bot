@@ -175,12 +175,15 @@ class QuizService:
 
     async def start(self, feature: str, message: Message) -> Message | None:
         scope, definitions = self._scope(message.chat.id), DEFINITIONS[feature]
+        publication_deadline = (
+            asyncio.get_running_loop().time() + definitions.photo_timeout if definitions.photo_timeout is not None else None
+        )
         collections = self.collections[feature]
         token = self._token(self.bot.id, message.chat.id, message.message_id)
         lock = self._lock(feature, message.chat.id)
         record: Record[RoundState] | None = None
         try:
-            async with lock:
+            async with asyncio.timeout_at(publication_deadline), lock:
                 for _ in range(8):
                     chat = await collections.chats.get(scope, "state")
                     existing = await collections.rounds.get(scope, token)
@@ -218,13 +221,16 @@ class QuizService:
                     raise Conflict()
         except (FeatureError, RepositoryError, TimeoutError) as error:
             record_handled_failure(error)
+            if isinstance(error, TimeoutError) and publication_deadline is not None:
+                return await self._send(message.reply("Ошибка, попробуйте еще раз"))
             return await self._send(message.reply("Не удалось сохранить игру. Попробуй чуть позже."))
         finally:
             self._unlock(feature, message.chat.id, lock)
 
         sending = False
         try:
-            async with asyncio.timeout(PHOTO_TIMEOUT), self._providers:
+            deadline = publication_deadline if publication_deadline is not None else asyncio.get_running_loop().time() + PHOTO_TIMEOUT
+            async with asyncio.timeout_at(deadline), self._providers:
                 chat = await collections.chats.get(scope, "state")
                 question = await definitions.load([] if chat is None else chat.value.recent)
                 photo = await definitions.photo(question)

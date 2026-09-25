@@ -7,10 +7,11 @@ from typing import Literal
 
 from aiogram.types import BufferedInputFile
 
-from msu_hub_bot.commands import chess_view, geoguess_view
+from msu_hub_bot.commands import art_view, chess_view, geoguess_view
 from msu_hub_bot.commands.quiz_view import View
 from msu_hub_bot.games.models import Question, RoundState, Vote
 from msu_hub_bot.media.chessboard import render_board
+from msu_hub_bot.providers.art import Artwork, download_artwork, random_artwork
 from msu_hub_bot.providers.chess import MoveOption, Puzzle, random_puzzle
 from msu_hub_bot.providers.geoguess import COUNTRIES, Photo, random_photo
 
@@ -34,11 +35,39 @@ def geoguess_photo(question: Question) -> Photo:
     return Photo(*(value or "" for value in values))
 
 
+def artwork(question: Question) -> Artwork:
+    if not question.artwork_title or not question.author or not question.url or not question.source:
+        raise ValueError("Incomplete art question")
+    return Artwork(
+        id=question.identity,
+        title=question.artwork_title,
+        artist=question.author,
+        date=question.artwork_date or "",
+        image_url=question.url,
+        source_url=question.source,
+    )
+
+
 @dataclass(frozen=True)
 class Definition:
-    name: Literal["chess", "geoguess"]
+    name: Literal["chess", "geoguess", "art"]
+    photo_timeout: float | None = None
 
     async def load(self, recent: list[str]) -> Question:
+        if self.name == "art":
+            art_puzzle = await random_artwork(tuple(recent))
+            painting = art_puzzle.artwork
+            return Question(
+                kind="art",
+                identity=painting.id,
+                choices=list(art_puzzle.options),
+                answer=art_puzzle.answer,
+                artwork_title=painting.title,
+                artwork_date=painting.date,
+                author=painting.artist,
+                url=painting.image_url,
+                source=painting.source_url,
+            )
         if self.name == "chess":
             puzzle = await random_puzzle(tuple(recent))
             return Question(
@@ -69,6 +98,8 @@ class Definition:
         )
 
     async def photo(self, question: Question, *, solution: bool = False) -> BufferedInputFile | str:
+        if self.name == "art":
+            return BufferedInputFile(await download_artwork(artwork(question).image_url), filename="art.jpg")
         if self.name == "geoguess":
             if question.url is None:
                 raise ValueError("Missing geography photo")
@@ -87,6 +118,12 @@ class Definition:
             raise ValueError("Missing quiz question")
         closed = state.phase == "closed"
         scored = None if state.score_status == "pending" else state.score_status == "recorded"
+        if self.name == "art":
+            art_players = [
+                art_view.Player(vote.user_id, vote.name, vote.username, question.choices[vote.choice], vote.choice == question.answer)
+                for vote in votes
+            ]
+            return art_view.render(artwork(question), art_players, closed=closed, scored=scored, page=state.page)
         if self.name == "chess":
             chess_players = [
                 chess_view.Player(vote.user_id, vote.name, vote.username, question.choices[vote.choice], vote.choice == question.answer)
@@ -101,3 +138,4 @@ class Definition:
 
 
 DEFINITIONS = {name: Definition(name) for name in ("chess", "geoguess")}
+DEFINITIONS["art"] = Definition("art", photo_timeout=20)
