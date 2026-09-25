@@ -410,11 +410,17 @@ async def main():
         def count(event):
             return sum(len(router.observers[event].handlers) for router in app.dispatcher.chain_tail)
 
-        assert count("message") == 273
-        assert count("callback_query") == 25
+        assert count("message") == 275
+        assert count("callback_query") == 26
         assert count("edited_message") == 149
         assert count("inline_query") == count("chosen_inline_result") == 0
-        for event, key in (("message", "Feedback.process"), ("callback_query", "Feedback.process_cb")):
+        for event, key in (
+            ("message", "Feedback.process"),
+            ("callback_query", "Feedback.process_cb"),
+            ("message", "Art.process"),
+            ("message", "Art.top"),
+            ("callback_query", "Art.process_cb"),
+        ):
             assert any(
                 handler.flags.get("handler_key") == key
                 for router in app.dispatcher.chain_tail
