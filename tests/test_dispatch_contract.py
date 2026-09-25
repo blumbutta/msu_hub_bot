@@ -13,6 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InaccessibleMessage, Update, User
 
 from msu_hub_bot.commands.chess import ChessCallback
+from msu_hub_bot.commands.art import ArtCallback
 from msu_hub_bot.commands.geoguess import GeoguessCallback
 from msu_hub_bot.commands.reactions import ReactionCallback
 from msu_hub_bot.telegram.filters import MetaCommand, SlashCommand
@@ -61,6 +62,9 @@ def aliases(handler):
 
 def is_added_route(handler):
     return aliases(handler) == ["py_stdin", "python_stdin"] or handler.flags["handler_key"] in {
+        "Art.process",
+        "Art.top",
+        "Art.process_cb",
         "Chess.process",
         "Chess.top",
         "Chess.process_cb",
@@ -86,7 +90,7 @@ def test_every_route_preserves_order_and_aliases():
     counts = Counter(route["event"] for route in CONTRACT["routes"])
     for kind, count in counts.items():
         actual = routes(root, "error" if kind == "errors" else kind)
-        extra = {"message": 12, "edited_message": 1, "callback_query": 6}.get(kind, 0)
+        extra = {"message": 14, "edited_message": 1, "callback_query": 7}.get(kind, 0)
         assert len(actual) == count + extra
         retained = [handler for handler in actual if not is_added_route(handler)]
         expected = [route for route in CONTRACT["routes"] if route["event"] == kind]
@@ -177,6 +181,12 @@ async def chess_selection_dispatcher():
         ("/CHESS_RATING@CONTRACT_BOT", "ChessRating.process"),
         ("/chess_play@another_bot", None),
         ("/chess_rating@another_bot", None),
+        ("/art", "Art.process"),
+        ("/ART@CONTRACT_BOT", "Art.process"),
+        ("/art_top", "Art.top"),
+        ("/ART_TOP@CONTRACT_BOT", "Art.top"),
+        ("/art@another_bot", None),
+        ("/art_top@another_bot", None),
     ],
 )
 async def test_chess_commands_select_real_routes_with_case_and_mentions(chess_selection_dispatcher, text, expected):
@@ -327,6 +337,8 @@ async def test_caption_styles_select_real_routes_in_text_and_media_captions(
     ("data", "expected"),
     [
         (ChessCallback(round="round-token", choice="0").pack(), "Chess.process_cb"),
+        (ArtCallback(round="round-token", choice="0").pack(), "Art.process_cb"),
+        (ArtCallback(round="round-token", choice="finish").pack(), "Art.process_cb"),
         (ChessCallback(round="round-token", choice="finish").pack(), "Chess.process_cb"),
         (GeoguessCallback(round="round-token", choice="0").pack(), "Geoguess.process_cb"),
         (GeoguessCallback(round="round-token", choice="finish").pack(), "Geoguess.process_cb"),
@@ -350,7 +362,10 @@ async def test_chess_and_geoguess_callbacks_select_separate_real_routes(chess_se
     assert bot.session.methods == []
 
 
-@pytest.mark.parametrize("callback_type,expected", [(ChessCallback, "Chess.process_cb"), (GeoguessCallback, "Geoguess.process_cb")])
+@pytest.mark.parametrize(
+    "callback_type,expected",
+    [(ChessCallback, "Chess.process_cb"), (GeoguessCallback, "Geoguess.process_cb"), (ArtCallback, "Art.process_cb")],
+)
 @pytest.mark.parametrize("choice", ["0", "finish", "page_1"])
 @pytest.mark.parametrize("conversation", ["ProgStates:stdin", "StickerStates:name", "MakePostStates:message"])
 async def test_quiz_buttons_preserve_active_conversations_and_other_topics(callback_type, expected, choice, conversation):
@@ -390,7 +405,7 @@ async def test_quiz_buttons_preserve_active_conversations_and_other_topics(callb
         await bot.session.close()
 
 
-@pytest.mark.parametrize("callback_type", [ChessCallback, GeoguessCallback])
+@pytest.mark.parametrize("callback_type", [ChessCallback, GeoguessCallback, ArtCallback])
 @pytest.mark.parametrize("missing", ["inaccessible", "inline"])
 async def test_quiz_buttons_without_an_accessible_chat_use_the_expired_fallback(chess_selection_dispatcher, callback_type, missing):
     bot, dispatcher = chess_selection_dispatcher
@@ -407,7 +422,7 @@ async def test_quiz_buttons_without_an_accessible_chat_use_the_expired_fallback(
     assert handler.callback.__qualname__ == "process_expired_callback"
 
 
-@pytest.mark.parametrize("command", ["/chess", "/chess_top", "/geoguess", "/geoguess_top"])
+@pytest.mark.parametrize("command", ["/chess", "/chess_top", "/geoguess", "/geoguess_top", "/art", "/art_top"])
 async def test_quiz_commands_still_belong_to_active_stdin_until_cancel(command):
     bot = make_bot()
     dispatcher = Dispatcher(disable_fsm=True)
