@@ -21,6 +21,7 @@ from msu_hub_bot.commands.admin import (
 from msu_hub_bot.commands.animate import process_animate, process_matrix
 from msu_hub_bot.commands.antibot import AntiBot
 from msu_hub_bot.commands.arxiv import process_arxiv
+from msu_hub_bot.commands.art import Art
 from msu_hub_bot.commands.camera import Camera
 from msu_hub_bot.commands.crypto import Crypto
 from msu_hub_bot.commands.debate import Debate
@@ -866,6 +867,26 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         StateFilter(None),
         F.content_type == ContentType.TEXT,
         flags={"handler_key": "process_gender", "fsm_release": True},
+    )
+    group("art").message.register(
+        Art.process,
+        MetaCommand("art"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Art.process", "fsm_release": True},
+    )
+    group("art").message.register(
+        Art.top,
+        MetaCommand("art_top"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Art.top", "fsm_release": True},
+    )
+    group("art").callback_query.register(
+        Art.process_cb,
+        Art.callback_data.filter(),
+        fsm_callback_allowed,
+        flags={"handler_key": "Art.process_cb", "fsm_release": True},
     )
     group("chess").message.register(
         Chess.process,
