@@ -32,16 +32,29 @@ request in flight, with a five-second cooldown; four requests can run concurrent
 
 ## Chat quizzes
 
+`/art` asks you to identify a painting's artist from six options;
 `/geoguess` asks you to locate a photo; `/chess` asks for the best move in a
 [Lichess puzzle](https://lichess.org/training). Each game keeps its question,
 solution and paginated results in one photo message. Votes stay hidden until
 anyone finishes the round or its ten-minute timer expires.
 
-`/geoguess_top` and `/chess_top` show separate daily chat rankings (Moscow time):
+`/art_top`, `/geoguess_top` and `/chess_top` show separate daily chat rankings (Moscow time):
 a correct answer earns one point; an error loses one, with a floor of zero.
 Rounds, votes and scores survive restarts in Supabase. Result navigation stays
 available for 24 hours after closure; daily scores are retained permanently.
 Lichess access is anonymous and subject to its shared request limits.
+
+Art questions come on demand from the
+[Cleveland Museum of Art API](https://openaccess-api.clevelandart.org/), without an API key
+or a local painting catalog. The bot samples the eligible public-domain painting
+collection, verifies a single individual artist and excludes the chat's last
+15 paintings. Museum titles, dates, attribution and links appear only after
+closure; artist names use the museum's spelling. Art has a 20-second total
+publication budget, including storage, downloading the image and Telegram upload.
+The catalog provider uses at most 16 seconds. The image is downloaded to bounded
+memory with an identified bot client, then uploaded to Telegram; no media files
+are kept on disk.
+Unavailable or ambiguous records fail cleanly without publishing a question.
 
 `/reactions` shows the chat's reaction receivers, givers, popular posts and emoji
 over 24 hours, seven days or thirty days. The bot needs administrator rights to
