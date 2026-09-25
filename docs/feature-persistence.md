@@ -197,7 +197,7 @@ Europe/Moscow, and lists or changes the author's reminders in the current
 chat/topic. Buttons carry exact revisions. The [Mini App](mini-app.md) provides
 an owner-wide list and edits using the same service and revision checks.
 
-### Chess and geoguess
+### Chess, geoguess and art
 
 `games/quiz.py` supplies the shared activity lifecycle; `games/definitions.py`
 adapts providers and the existing bounded caption renderers. Each game's
@@ -233,7 +233,7 @@ cannot leave a committed score without the progress that prevents replay.
 There is no separate scoring expiry: held work requires repair, and its round
 and votes remain until settlement resolves.
 
-`/chess_top` and `/geoguess_top` scan today's score records in bounded pages and
+`/chess_top`, `/geoguess_top` and `/art_top` scan today's score records in bounded pages and
 keep only the ten best entries in memory. A failed or timed-out scan produces an
 unavailable response, never a ranking made from only the pages retrieved.
 Rankings can reflect committed batches while a round is settling; the result
@@ -242,8 +242,16 @@ Older daily totals stay available in storage, including player labels, although
 the commands show only the current Moscow day.
 
 Presentation caches are disposable; rebuilding one must never change the
-selected question, votes or scores. Both games use only the feature store for
+selected question, votes or scores. All three quizzes use only the feature store for
 persistence.
+
+The art namespace stores the museum artwork ID, title, date, artist and trusted
+image/source URLs in the frozen question; these details appear only after closure.
+Its chat history excludes the last 15 paintings. Art has a 20-second publication
+deadline starting before chat reservation; the provider has a nested 16-second
+budget. Other quiz publication budgets and the shared ten-minute round duration
+remain unchanged. Timeout reporting and publication recovery use the same bounded
+Telegram delivery path as other quizzes.
 
 ### Raffles
 
