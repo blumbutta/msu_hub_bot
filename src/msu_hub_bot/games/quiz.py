@@ -23,6 +23,7 @@ from msu_hub_bot.commands.quiz_view import View
 from msu_hub_bot.games.definitions import DEFINITIONS, Definition
 from msu_hub_bot.games.models import ChatState, RoundState, Score, Vote
 from msu_hub_bot.games.scores import DAY_ZONE, SCORE_BATCH_SIZE, apply_batch, ranking
+from msu_hub_bot.providers.exceptions import ExternalServiceError
 from msu_hub_bot.storage.features import (
     Collection,
     Conflict,
@@ -587,7 +588,7 @@ class QuizService:
         state = record.value
         view = definitions.render(state, [vote.value for vote in votes])
         markup = self.keyboard(definitions, state, view)
-        needs_photo = job.feature == "chess" and state.phase == "closed" and not presentation.solution_shown
+        needs_photo = definitions.reveal_photo and state.phase == "closed" and not presentation.solution_shown
         if view == presentation.view and markup == presentation.markup and not needs_photo:
             return
         if not await context.current():
@@ -596,7 +597,7 @@ class QuizService:
         photo_retry = False
         if needs_photo and state.question is not None:
             try:
-                async with asyncio.timeout(5):
+                async with asyncio.timeout(definitions.reveal_timeout):
                     photo = await definitions.photo(state.question, solution=True)
                 if not await context.current():
                     return
@@ -610,7 +611,7 @@ class QuizService:
                     presentation,
                 )
                 presentation.solution_shown = delivered
-            except TimeoutError, TelegramAPIError:
+            except TimeoutError, TelegramAPIError, ExternalServiceError:
                 photo_retry = True
                 logger.warning("Quiz solution photo could not be updated")
             except ValueError, OSError:
@@ -634,7 +635,7 @@ class QuizService:
         if not delivered:
             raise JobHold("Quiz message can no longer be edited")
         presentation.view, presentation.markup = view, markup
-        # A text fallback is useful now; retrying the original job can still repair the board.
+        # A text fallback is useful now; retrying the original job can still reveal the image.
         if needs_photo and not presentation.solution_shown:
             if photo_retry:
                 raise JobRetry("Quiz solution photo can safely be retried")

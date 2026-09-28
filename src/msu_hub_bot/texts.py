@@ -112,8 +112,8 @@ cmd_help = f"""{hbold("Функции бота")}
 • /loc — из локации даёт широту и долготу, из широты и долготы даёт локацию
 • /excuse — генерирует отмазку
 • /gender — узнать гендер
-• /geoguess — страна; /chess — лучший ход; /art — художник
-• Дневной рейтинг: /geoguess_top, /chess_top, /art_top
+• Викторины: /geoguess, /chess, /art, /pokemon
+• Топ дня: /geoguess_top, /chess_top, /art_top, /pokemon_top
 • /chess_play — партия с другом, 10+5; /chess_rating — общий Elo
 • /json — системная информация о сообщении
 • /donate — поддержать развитие бота

@@ -7,13 +7,15 @@ from typing import Literal
 
 from aiogram.types import BufferedInputFile
 
-from msu_hub_bot.commands import art_view, chess_view, geoguess_view
+from msu_hub_bot.commands import art_view, chess_view, geoguess_view, pokemon_view
 from msu_hub_bot.commands.quiz_view import View
 from msu_hub_bot.games.models import Question, RoundState, Vote
 from msu_hub_bot.media.chessboard import render_board
+from msu_hub_bot.media.pokemon import render_pokemon
 from msu_hub_bot.providers.art import Artwork, download_artwork, random_artwork
 from msu_hub_bot.providers.chess import MoveOption, Puzzle, random_puzzle
 from msu_hub_bot.providers.geoguess import COUNTRIES, Photo, random_photo
+from msu_hub_bot.providers.pokemon import Pokemon, download_pokemon, random_pokemon
 
 
 def chess_puzzle(question: Question) -> Puzzle:
@@ -48,12 +50,32 @@ def artwork(question: Question) -> Artwork:
     )
 
 
+def pokemon(question: Question) -> Pokemon:
+    if not question.pokemon_name or not question.url or not question.source:
+        raise ValueError("Incomplete pokemon question")
+    return Pokemon(id=question.identity, name=question.pokemon_name, image_url=question.url, source_url=question.source)
+
+
 @dataclass(frozen=True)
 class Definition:
-    name: Literal["chess", "geoguess", "art"]
+    name: Literal["chess", "geoguess", "art", "pokemon"]
     photo_timeout: float | None = None
+    reveal_photo: bool = False
+    reveal_timeout: float = 5
 
     async def load(self, recent: list[str]) -> Question:
+        if self.name == "pokemon":
+            pokemon_puzzle = await random_pokemon(tuple(recent))
+            selected = pokemon_puzzle.pokemon
+            return Question(
+                kind="pokemon",
+                identity=selected.id,
+                choices=list(pokemon_puzzle.options),
+                answer=pokemon_puzzle.answer,
+                pokemon_name=selected.name,
+                url=selected.image_url,
+                source=selected.source_url,
+            )
         if self.name == "art":
             art_puzzle = await random_artwork(tuple(recent))
             painting = art_puzzle.artwork
@@ -98,6 +120,10 @@ class Definition:
         )
 
     async def photo(self, question: Question, *, solution: bool = False) -> BufferedInputFile | str:
+        if self.name == "pokemon":
+            source = await download_pokemon(pokemon(question).image_url)
+            image = await asyncio.to_thread(render_pokemon, source, solution=solution)
+            return BufferedInputFile(image, filename="pokemon-solution.png" if solution else "pokemon.png")
         if self.name == "art":
             return BufferedInputFile(await download_artwork(artwork(question).image_url), filename="art.jpg")
         if self.name == "geoguess":
@@ -118,6 +144,12 @@ class Definition:
             raise ValueError("Missing quiz question")
         closed = state.phase == "closed"
         scored = None if state.score_status == "pending" else state.score_status == "recorded"
+        if self.name == "pokemon":
+            pokemon_players = [
+                pokemon_view.Player(vote.user_id, vote.name, vote.username, question.choices[vote.choice], vote.choice == question.answer)
+                for vote in votes
+            ]
+            return pokemon_view.render(pokemon(question), pokemon_players, closed=closed, scored=scored, page=state.page)
         if self.name == "art":
             art_players = [
                 art_view.Player(vote.user_id, vote.name, vote.username, question.choices[vote.choice], vote.choice == question.answer)
@@ -137,5 +169,6 @@ class Definition:
         return geoguess_view.render(geoguess_photo(question), geo_players, closed=closed, scored=scored, page=state.page)
 
 
-DEFINITIONS = {name: Definition(name) for name in ("chess", "geoguess")}
+DEFINITIONS = {name: Definition(name, reveal_photo=name == "chess") for name in ("chess", "geoguess")}
 DEFINITIONS["art"] = Definition("art", photo_timeout=20)
+DEFINITIONS["pokemon"] = Definition("pokemon", photo_timeout=20, reveal_photo=True, reveal_timeout=10)

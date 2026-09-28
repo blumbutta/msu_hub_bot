@@ -32,13 +32,14 @@ request in flight, with a five-second cooldown; four requests can run concurrent
 
 ## Chat quizzes
 
+`/pokemon` asks you to identify a Pokémon silhouette;
 `/art` asks you to identify a painting's artist from six options;
 `/geoguess` asks you to locate a photo; `/chess` asks for the best move in a
 [Lichess puzzle](https://lichess.org/training). Each game keeps its question,
 solution and paginated results in one photo message. Votes stay hidden until
 anyone finishes the round or its ten-minute timer expires.
 
-`/art_top`, `/geoguess_top` and `/chess_top` show separate daily chat rankings (Moscow time):
+`/pokemon_top`, `/art_top`, `/geoguess_top` and `/chess_top` show separate daily chat rankings (Moscow time):
 a correct answer earns one point; an error loses one, with a floor of zero.
 Rounds, votes and scores survive restarts in Supabase. Result navigation stays
 available for 24 hours after closure; daily scores are retained permanently.
@@ -55,6 +56,17 @@ The catalog provider uses at most 16 seconds. The image is downloaded to bounded
 memory with an identified bot client, then uploaded to Telegram; no media files
 are kept on disk.
 Unavailable or ambiguous records fail cleanly without publishing a question.
+
+Pokémon questions use the full [PokéAPI species catalog](https://pokeapi.co/docs/v2),
+with no API key or local gallery. The target is sampled uniformly outside the chat's
+last 15 species; its canonical default form supplies the official transparent artwork.
+Six distinct English species names appear as options. The bot builds a silhouette
+from the image's transparency and reveals the same pose in colour after closure;
+source links and individual choices are also hidden until then. Publication has
+one 20-second budget, including the upload. Validated metadata and images are cached
+in bounded RAM in accordance with PokéAPI's caching policy, without writing images
+to disk. Temporary reveal failures still show the answer and score; the shared worker
+retries the colour image without awarding points again. No model or GPU is required.
 
 `/reactions` shows the chat's reaction receivers, givers, popular posts and emoji
 over 24 hours, seven days or thirty days. The bot needs administrator rights to

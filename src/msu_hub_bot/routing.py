@@ -21,6 +21,7 @@ from msu_hub_bot.commands.admin import (
 from msu_hub_bot.commands.animate import process_animate, process_matrix
 from msu_hub_bot.commands.antibot import AntiBot
 from msu_hub_bot.commands.arxiv import process_arxiv
+from msu_hub_bot.commands.pokemon import Pokemon
 from msu_hub_bot.commands.art import Art
 from msu_hub_bot.commands.camera import Camera
 from msu_hub_bot.commands.crypto import Crypto
@@ -867,6 +868,26 @@ def build_router(*, wit: Wit, wolfram: WolframAPI, config: Settings) -> Router:
         StateFilter(None),
         F.content_type == ContentType.TEXT,
         flags={"handler_key": "process_gender", "fsm_release": True},
+    )
+    group("pokemon").message.register(
+        Pokemon.process,
+        MetaCommand("pokemon"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Pokemon.process", "fsm_release": True},
+    )
+    group("pokemon").message.register(
+        Pokemon.top,
+        MetaCommand("pokemon_top"),
+        StateFilter(None),
+        F.content_type == ContentType.TEXT,
+        flags={"handler_key": "Pokemon.top", "fsm_release": True},
+    )
+    group("pokemon").callback_query.register(
+        Pokemon.process_cb,
+        Pokemon.callback_data.filter(),
+        fsm_callback_allowed,
+        flags={"handler_key": "Pokemon.process_cb", "fsm_release": True},
     )
     group("art").message.register(
         Art.process,
